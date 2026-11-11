@@ -69,13 +69,21 @@ function create_term(input_list)
 end
 
 function create_arithmetic_expression(input_list)
-    # Handle unary minus case - if first element is a minus operator
-    if length(input_list) >= 2 && input_list[1] isa BMSubtract
-        return BaseModelicaUnaryMinus(input_list[2])
+    # A leading add operator is unary: it applies to the first term only, and the
+    # remaining `op term` pairs are then folded left onto it as usual.
+    start = 1
+    left_el = input_list[1]
+    if length(input_list) >= 2 && input_list[1] isa Union{BMAdd, BMElementWiseAdd}
+        left_el = input_list[2]
+        start = 2
+    elseif length(input_list) >= 2 &&
+            input_list[1] isa Union{BMSubtract, BMElementWiseSubtract}
+        left_el = BaseModelicaUnaryMinus(input_list[2])
+        start = 2
     end
 
-    left_el = input_list[1]
-    for (i, element) in enumerate(input_list)
+    for i in start:length(input_list)
+        element = input_list[i]
         left_el = @match element begin
             ::BMAdd => BaseModelicaSum(left_el, input_list[i + 1]) #make a sum between the previous item and next item
             ::BMElementWiseAdd => BaseModelicaElementWiseSum(left_el, input_list[i + 1])

@@ -15,6 +15,26 @@ PC = BM.ParserCombinator
         unary_minus_test = only(PC.parse_one("-5", BM.arithmetic_expression))
         @test unary_minus_test isa BM.BaseModelicaUnaryMinus
         @test BM.eval_AST(unary_minus_test) == -5.0
+
+        # Terms after a leading unary minus must not be dropped
+        @test BM.eval_AST(only(PC.parse_one("-5 - 3", BM.arithmetic_expression))) == -8.0
+        @test BM.eval_AST(only(PC.parse_one("-2*3 + 10", BM.arithmetic_expression))) == 4.0
+        @test BM.eval_AST(only(PC.parse_one("-2^2 + 1", BM.arithmetic_expression))) == -3.0
+        @test BM.eval_AST(only(PC.parse_one("+2 - 3 + 4", BM.arithmetic_expression))) == 3.0
+        @test BM.eval_AST(only(PC.parse_one("-1 + 2 - 3", BM.arithmetic_expression))) == -2.0
+    end
+
+    @testset "Leading Unary Minus In Equation" begin
+        unary_path = joinpath(
+            dirname(dirname(pathof(BM))), "test", "testfiles", "UnaryMinusLeading.bmo"
+        )
+        unary_system = parse_basemodelica(unary_path, parser = :julia)
+        dv_eq = only(filter(eq -> isequal(eq.lhs, BM.D(unary_system.v)), equations(unary_system)))
+        # der('v') = -'x' - 0.1*'v' must keep the damping term
+        rhs_val = ModelingToolkit.substitute(
+            dv_eq.rhs, Dict(unary_system.x => 2.0, unary_system.v => 3.0)
+        )
+        @test ModelingToolkit.Symbolics.value(rhs_val) ≈ -2.3
     end
 
     @testset "Annotation Parsing" begin
