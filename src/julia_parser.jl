@@ -209,13 +209,20 @@ function BaseModelicaString(input_list::Array{<:Any})
 end
 
 function BaseModelicaWhenEquation(input_list)
+    # input_list: BMWhen, condition, BMThen, equations..., [BMWhen, condition, BMThen, ...]
     whens = []
     thens = []
-    for (i, element) in enumerate(input_list)
-        @match element begin
-            ::BMWhen => push!(whens, input_list[i + 1])
-            ::BMThen => push!(thens, input_list[i + 1])
-            _ => nothing
+    expect_condition = false
+    for element in input_list
+        if element isa BMWhen
+            expect_condition = true
+        elseif element isa BMThen
+            push!(thens, [])
+        elseif expect_condition
+            push!(whens, element)
+            expect_condition = false
+        else
+            push!(thens[end], element)
         end
     end
     return BaseModelicaWhenEquation(whens, thens)
