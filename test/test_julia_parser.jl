@@ -48,6 +48,30 @@ PC = BM.ParserCombinator
         @test BM.eval_AST(annotation_test) === nothing
     end
 
+    @testset "Comments (trailing, own-line and block)" begin
+        comments_path = joinpath(
+            dirname(dirname(pathof(BM))), "test", "testfiles", "TrailingComments.bmo"
+        )
+        # A trailing `// comment` used to make the parser backtrack for minutes. Parse in a
+        # subprocess so a regression fails the test instead of hanging the suite.
+        code = "using BaseModelica; BaseModelica.parse_file_julia(ARGS[1])"
+        proc = run(
+            pipeline(
+                `$(Base.julia_cmd()) --project=$(Base.active_project()) -e $code $comments_path`;
+                stdout = devnull, stderr = devnull
+            );
+            wait = false
+        )
+        finished = timedwait(() -> process_exited(proc), 300.0)
+        finished === :ok || kill(proc)
+        @test finished === :ok
+        @test success(proc)
+
+        comments_system = parse_basemodelica(comments_path, parser = :julia)
+        @test comments_system isa System
+        @test length(unknowns(comments_system)) == 1
+    end
+
     @testset "Newton Cooling" begin
         newton_path = joinpath(
             dirname(dirname(pathof(BM))), "test", "testfiles", "NewtonCoolingBase.bmo"

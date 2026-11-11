@@ -318,7 +318,10 @@ function component_reference_or_function_call(input_list)
 end
 
 list2string(x) = isempty(x) ? x : reduce(*, x)
-spc = Drop(Star(Space()))
+# Whitespace and comments between tokens. Comments must be skipped here: a comment the
+# grammar cannot consume makes the parse fail, and with NoCache the parser then
+# backtracks through every alternative, which takes minutes on larger models.
+spc = Drop(Star(Space() | p"//[^\r\n]*" | p"/[*]([^*]|[*]+[^*/])*[*]+/"))
 # Base Modelica grammar
 @with_names begin
     NL = p"\r\n" | p"\n" | p"\r"
