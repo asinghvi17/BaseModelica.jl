@@ -665,8 +665,14 @@ function visit_equation(visitor::ASTBuilderVisitor, ctx::Py)
                 comment_text
             )
         else
-            # Just an expression (no '='), could be a function call
-            return nothing
+            # A bare function-call statement such as `reinit(x, e)` or `assert(...)`.
+            # Keep it with an empty right-hand side, like the :julia parser does, so the
+            # evaluator can lower it or reject it instead of it disappearing here.
+            comment_text = visit_comment(visitor, ctx.comment())
+            return BaseModelicaAnyEquation(
+                BaseModelicaSimpleEquation(simple_expr, nothing),
+                comment_text
+            )
         end
     end
 end
@@ -791,22 +797,29 @@ function visit_whenEquation(visitor::ASTBuilderVisitor, ctx::Py)
     whens = []
     thens = []
 
-    # Get all condition expressions
-    expr_ctxs = ctx.expression()
-    for expr_ctx in expr_ctxs
-        push!(whens, visit_expression(visitor, expr_ctx))
-    end
-
-    # All body equations go into a single branch (elsewhen not yet supported)
-    eq_ctxs = ctx.equation()
-    branch_equations = []
-    for eq_ctx in eq_ctxs
-        eq = visit_equation(visitor, eq_ctx)
-        if !isnothing(eq)
-            push!(branch_equations, eq)
+    # Walk the children in order: each 'when'/'elsewhen' keyword starts a branch whose
+    # condition is the next child, followed by that branch's equations.
+    child_count = pyconvert(Int, ctx.getChildCount())
+    i = 0
+    while i < child_count
+        child_text = pyconvert(String, ctx.getChild(i).getText())
+        if child_text == "when" || child_text == "elsewhen"
+            push!(whens, visit_expression(visitor, ctx.getChild(i + 1)))
+            push!(thens, [])
+            i += 2
+        elseif child_text == "end"
+            break  # 'end' 'when'
+        elseif child_text == "then" || child_text == ";"
+            i += 1
+        else
+            child = ctx.getChild(i)
+            if pyhasattr(child, "simpleExpression")
+                eq = visit_equation(visitor, child)
+                isnothing(eq) || push!(thens[end], eq)
+            end
+            i += 1
         end
     end
-    push!(thens, branch_equations)
 
     return BaseModelicaWhenEquation(whens, thens)
 end
