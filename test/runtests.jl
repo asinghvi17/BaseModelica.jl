@@ -11,6 +11,7 @@ run_tests(;
         @safetestset "Julia Parser Tests" include("test_julia_parser.jl")
         @safetestset "ANTLR Parser Tests" include("test_antlr_parser.jl")
         @safetestset "Error Message Tests" include("test_error_messages.jl")
+        @safetestset "Event Tests" include("test_events.jl")
         @safetestset "Precompile Workload Tests" include("test_precompile_workload.jl")
         return nothing
     end,

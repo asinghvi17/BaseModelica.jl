@@ -119,6 +119,10 @@ initial_value_map = Dict()
 # names of variables that only appear in when-equation bodies (declared as discrete parameters)
 discrete_variable_names = Set{Symbol}()
 
+# names of Boolean variables defined by a relation (e.g. `off = s < 0`), lowered to
+# discrete parameters updated by a zero-crossing callback
+bool_comparison_names = Set{Symbol}()
+
 # names of parameters declared with fixed = false (to be solved during initialization)
 free_parameter_names = Set{Symbol}()
 
