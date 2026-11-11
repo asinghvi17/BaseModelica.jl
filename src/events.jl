@@ -394,23 +394,25 @@ end
 """
     synchtoolkit_backend()
 
-Return the SynchToolkit discrete backend, or `nothing` when SynchToolkit.jl is not loaded.
-Defined by the `BaseModelicaSynchToolkitExt` extension.
+Return the SynchToolkit discrete backend. The method is defined by the
+`BaseModelicaSynchToolkitExt` extension, so it exists only when SynchToolkit.jl is loaded.
 """
-synchtoolkit_backend() = nothing
+function synchtoolkit_backend end
 
+# `:auto` currently always selects the MTK backend: the SynchToolkit backend is opt-in until
+# it is validated against a SynchToolkit release (see the extension for known issues with
+# SynchToolkit 0.4.8). Loading SynchToolkit therefore never changes results on its own.
 function select_backend(backend)
     backend isa DiscreteBackend && return backend
+    has_synch = applicable(synchtoolkit_backend)
     if backend === :auto
-        st = synchtoolkit_backend()
-        return isnothing(st) ? MTKEventsBackend() : st
+        return MTKEventsBackend()
     elseif backend === :mtk
         return MTKEventsBackend()
     elseif backend === :synchtoolkit
-        st = synchtoolkit_backend()
-        isnothing(st) &&
+        has_synch ||
             error("discrete_backend = :synchtoolkit requires SynchToolkit.jl to be loaded (`using SynchToolkit`)")
-        return st
+        return synchtoolkit_backend()
     end
     return error("Unknown discrete_backend $(repr(backend)). Use :auto, :mtk or :synchtoolkit")
 end
