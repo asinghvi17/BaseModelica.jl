@@ -1,0 +1,13 @@
+# SynchToolkit 0.5.2, SynchJulia 0.8.6, MTK 11.45.5, Julia 1.13.3
+==== DiscreteCounter
+Success occ n: [0.5000000000000021 => 1.0]
+BoundsError: attempt to access 1-element Vector{ModelingToolkitBase.NestedGetIndex{Tuple{Vector{Float64}}}} at index [0]
+
+Stacktrace:
+==== WhenElsewhen
+Success occ a: [0.25 => 1.0]
+ occ b: [0.7500000000000014 => 2.0]
+==== BouncingBallCounter
+Success occ bounces: [0.4515236409857314 => 1.0, 1.1739614665628753 => 2.0, 1.7519117270245583 => 3.0, 2.214271935393891 => 4.0, 2.584160102089349 => 5.0, 2.8800706354457155 => 6.0]
+ min h=2.3028551232140846e-17 flips=6
+[ Info: ANTLR parser initialized successfully

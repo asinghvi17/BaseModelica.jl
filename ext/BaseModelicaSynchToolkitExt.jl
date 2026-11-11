@@ -11,11 +11,12 @@
 # A clause containing only `reinit`s has no clocked variables, so it is lowered with the
 # MTK events backend (a plain SymbolicContinuousCallback that is not linked to a clock).
 #
-# Experimental: selected only with `discrete_backend = :synchtoolkit`. Checked against
-# SynchToolkit 0.4.8 (the version installable when this was written): counters on an event
-# clock tick at the right times and values, but `Hold(v)` reports the post-tick value before
-# the first tick, constant assignments (`v = 1.0`) record NaN, and `Impulsive` on an event
-# clock fails inside SynchToolkit (`UndefVarError: typ`). Re-check with SynchToolkit 0.5.
+# Experimental: selected only with `discrete_backend = :synchtoolkit`. With SynchToolkit
+# 0.5.2 counters, elsewhen branches, constant assignments and `Impulsive` reinit on an event
+# clock give correct results, but a continuous observable reading `Hold(v)` cannot be
+# evaluated before `v`'s first tick ("Cannot access discrete variable ... before initial
+# save"). SynchToolkit 0.4.8 additionally mis-handles Hold before the first tick, constant
+# assignments and Impulsive on event clocks.
 module BaseModelicaSynchToolkitExt
 
 using BaseModelica: BaseModelica, DiscreteBackend, LoweredEvents, MTKEventsBackend,

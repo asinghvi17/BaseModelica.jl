@@ -11,8 +11,8 @@ Environment:
 - Julia 1.13.3. The suite started on 1.12.7, but the juliaup install changed during the
   task and 1.12.7 was removed.
 - ModelingToolkit 11.45.5, ModelingToolkitBase 1.77.5, Symbolics 7.46.0, OrdinaryDiffEq 7.8.1.
-- Dyad env: DyadInterface 7.5.1, SynchToolkit 0.4.8, SynchJulia 0.2.3. These are the
-  versions already in the read-only `~/.julia`; see "SynchToolkit" for why not 0.5.2.
+- Dyad env: DyadInterface 7.5.1, SynchToolkit 0.5.2, SynchJulia 0.8.6. An earlier
+  validation used 0.4.8 / 0.2.3.
 
 ## Commits (oldest first)
 
@@ -26,7 +26,8 @@ Environment:
 6. `fcca725` Keep every equation of a when-branch body in the :julia parser
 7. `0782f34` Support user functions, algorithm statements and array constructors (item 5)
 8. `b567948` Add an experimental SynchToolkit discrete backend as a package extension
-9. README and outputs (this report, Dyad end-to-end script)
+9. `9e782c7` README and outputs (this report, Dyad end-to-end script)
+10. Validation on SynchToolkit 0.5.2 (logs, report, extension notes)
 
 ## Fixes
 
@@ -150,35 +151,42 @@ clock. This follows the scout's advice: an affect on a linked callback is swallo
 Compilation is `mtkcompile(sys; additional_passes = [SynchToolkit.compile_lustre])`.
 DyadInterface's `simplify_model` adds that pass itself.
 
-**Validation, SynchToolkit 0.4.8** (`outputs/scripts/synchtoolkit_probe.{jl,log}`):
-- Counter on an event clock: ticks at t = 0.5 to 1.0, and `y(1) = 3` is correct.
-- But `Hold(n)` reports the post-tick value before the first tick: `y(0.25) = 1.5`,
-  expected 0.5.
-- Constant assignments (`a = 1.0`) record NaN.
-- `Impulsive` on an event clock fails inside SynchToolkit with
-  `UndefVarError: typ not defined in SynchToolkit`.
-- Bouncing ball (reinit only): correct, because it goes through the MTK callback.
+**Validation on SynchToolkit 0.5.2** (SynchJulia 0.8.6, DyadInterface 7.5.1, MTK 11.45.5).
+Logs: `outputs/scripts/synchtoolkit_probe_0.5.2.log` and `dyad_pipeline.log`.
 
-Because of these wrong results, `discrete_backend = :auto` **selects the MTK backend**.
-SynchToolkit runs only with `discrete_backend = :synchtoolkit`, so loading SynchToolkit
-never changes results by itself. This deviates from "must go through SynchToolkit" and is
-deliberate until the backend is validated on 0.5.2. Flipping it is a one-line change in
-`select_backend` (`src/events.jl`).
+| Model | Result |
+|---|---|
+| `BouncingBallCounter` (reinit via `Impulsive` plus a counter on the same `EventClock`) | correct: 6 bounces, the first at t = 0.4515 = √(2/g), min h ≈ 2e-17, counter 1…6 |
+| `WhenElsewhen` (constant assignments, two clocks) | correct: a = 1 at t = 0.25, b = 2 at t = 0.75 |
+| `DiscreteCounter` | ticks once at t = 0.5 with n = 1, and y(1) = 3 is correct |
+| `BouncingBall` | identical to the MTK backend through `simplify_model`, `create_odeproblem` and `TransientAnalysis` |
 
-**Why not 0.5.2:**
-- 0.5.2 needs SynchJulia ≥ 0.8.6 from DyadRegistry. The local registry snapshot stops at
-  0.8.4.
-- `Pkg.add` from GitHub needed credentials. My attempt to configure `gh` as git
-  credential helper through env vars was denied by the permission classifier, and so was
-  `Pkg.develop` from my own `gh` clones.
-- The head's later hint (`JULIA_PKG_SERVER=internal.juliahub.com` with `~/.julia` on the
-  depot path) does not help as stated. Pkg reads `servers/<host>/auth.toml` only from the
-  **first** depot (`Pkg.depots1()`, `PlatformEngines.jl:60`), and the first depot has to
-  be a writable clone-local one because `~/.julia` is read-only in this sandbox. I did not
-  copy credentials.
+The `DiscreteCounter` gap: the continuous observable `y = 2x + Hold(n)` cannot be
+evaluated before n's first tick. `sol(0.25, idxs = y)` throws "Cannot access discrete
+variable at time 0.25 before initial save 0.5", and `sol[y]` throws a `BoundsError`. The
+MTK backend gives 0.5. SynchToolkit's own test suite marks the same pre-first-tick value
+as broken.
 
-To validate on 0.5.2, a human can run
-`julia --project=<env with SynchToolkit 0.5.2> outputs/scripts/synchtoolkit_probe.jl`.
+Because of this gap, `discrete_backend = :auto` **still selects the MTK backend**, and
+SynchToolkit runs only with `discrete_backend = :synchtoolkit`. This deviates from "must
+go through SynchToolkit". Flip it in `select_backend` (`src/events.jl`) once
+pre-first-tick holds work. Making the start value visible before the first tick may need
+an `InitClock` tick or a SynchToolkit change.
+
+SynchToolkit 0.4.8 results are kept for reference in `synchtoolkit_probe_0.4.8.log`:
+- `Hold` showed the post-tick value before the first tick;
+- constant assignments gave NaN;
+- `Impulsive` on an event clock failed with `UndefVarError: typ`.
+
+**How 0.5.2 was installed.** The package server answered 401: Pkg reads `auth.toml` only
+from the first depot (`Pkg.depots1()`), which is the writable clone-local one. The local
+DyadRegistry snapshot also stopped at SynchJulia 0.8.4. What worked, with no credential
+handling:
+- `Pkg.Registry.add(url = "https://github.com/JuliaComputing/DyadRegistry")` into the
+  writable depot;
+- then `Pkg.add` with `JULIA_PKG_USE_CLI_GIT=true` and `GIT_TERMINAL_PROMPT=0`, so private
+  packages are cloned by the box's CLI git;
+- `JULIA_DEPOT_PATH = <clone>/.julia-depot:~/.julia`.
 
 ## Test results
 
@@ -220,7 +228,8 @@ not run.
 Other verification runs (scripts in the scratch env, outputs in `outputs/scripts/*.log`):
 - `dyad_pipeline.jl`: MTK and SynchToolkit backends through `simplify_model`,
   `create_odeproblem` and `TransientAnalysis`.
-- `synchtoolkit_probe.jl`: the SynchToolkit 0.4.8 behaviour listed above.
+- `synchtoolkit_probe.jl`: the SynchToolkit behaviour listed above, with logs for 0.5.2
+  and 0.4.8.
 
 ## Remaining gaps
 
@@ -240,6 +249,7 @@ Other verification runs (scripts in the scratch env, outputs in `outputs/scripts
 - Models with **no continuous states** (e.g. `WhenEquation.bmo`) build, but Tsit5 cannot
   solve an empty state vector. This was already the case before this branch.
 - **Integer discretes** are represented as `Real`, so `n` holds `1.0`.
-- **SynchToolkit backend:** experimental, with the 0.4.8 issues listed above.
+- **SynchToolkit backend:** experimental and opt-in. It fails when a continuous
+  observable reads a discrete variable before that variable's first tick (0.5.2).
 - **Possible upstream MTK issue:** affects on systems with observed equations need
   explicit holds for unassigned states.

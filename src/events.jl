@@ -399,9 +399,8 @@ Return the SynchToolkit discrete backend. The method is defined by the
 """
 function synchtoolkit_backend end
 
-# `:auto` currently always selects the MTK backend: the SynchToolkit backend is opt-in until
-# it is validated against a SynchToolkit release (see the extension for known issues with
-# SynchToolkit 0.4.8). Loading SynchToolkit therefore never changes results on its own.
+# `:auto` currently always selects the MTK backend: the SynchToolkit backend is opt-in while
+# it has known gaps (see the extension). Loading SynchToolkit never changes results on its own.
 function select_backend(backend)
     backend isa DiscreteBackend && return backend
     has_synch = applicable(synchtoolkit_backend)

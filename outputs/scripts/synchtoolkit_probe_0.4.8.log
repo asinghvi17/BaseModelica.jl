@@ -1,3 +1,4 @@
+# SynchToolkit 0.4.8, SynchJulia 0.2.3, MTK 11.45.5
 ==== DiscreteCounter
 Success occ n: [0.5000000000000021 => 1.0]
  y at saved: [(0.0, 1.0), (0.005, 1.011), (0.058, 1.116), (0.5, 2.0), (1.0, 3.0)]

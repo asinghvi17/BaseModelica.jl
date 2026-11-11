@@ -1,6 +1,6 @@
 # Probe of the experimental SynchToolkit discrete backend (discrete_backend = :synchtoolkit).
 # Run in an environment with BaseModelica (this branch), SynchToolkit, OrdinaryDiffEq.
-# Output from SynchToolkit 0.4.8 / SynchJulia 0.2.3 is in synchtoolkit_probe.log.
+# Outputs: synchtoolkit_probe_0.5.2.log (SynchToolkit 0.5.2) and synchtoolkit_probe_0.4.8.log.
 using BaseModelica, SynchToolkit, OrdinaryDiffEq, ModelingToolkit
 const T = joinpath(pkgdir(BaseModelica), "test", "testfiles")
 for (f, var, tend) in (("DiscreteCounter", :n, 1.0), ("WhenElsewhen", :a, 1.0), ("BouncingBallCounter", :bounces, 3.0))

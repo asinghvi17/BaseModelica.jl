@@ -1,6 +1,4 @@
-
-  1 dependency had output during precompilation:
-┌ BaseModelica
+# SynchToolkit 0.5.2, SynchJulia 0.8.6, DyadInterface 7.5.1, MTK 11.45.5, Julia 1.13.3
 
 [ Info: ANTLR parser initialized successfully
 [mtk] unsimplified System: 2 equations, 1 continuous event(s); experiment (StartTime = 0.0, StopTime = 3.0, Tolerance = 1.0e-6, Interval = 0.01)
@@ -12,4 +10,4 @@
 [synchtoolkit] create_odeproblem(simplify_model)retcode=Success  min(h)=8.522121416930241e-18  bounces=6
 [synchtoolkit] TransientAnalysis              retcode=Success  min(h)=1.353748936186711e-16  bounces=6
 [mtk] DiscreteCounter                         retcode=Success  y(0.25)=0.5 (expect 0.5)  y(1)=2.9999999999999902 (expect 3)
-[synchtoolkit] DiscreteCounter                retcode=Success  y(0.25)=1.5 (expect 0.5)  y(1)=2.9999999999999902 (expect 3)
+[synchtoolkit] DiscreteCounter                retcode=Success  y(0.25)=error: Cannot access discrete variable at time 0.25 before initial save 0.5000000000000021 (expect 0.5)  y(1)=2.9999999999999902 (expect 3)

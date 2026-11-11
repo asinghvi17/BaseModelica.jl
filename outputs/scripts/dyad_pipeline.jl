@@ -53,6 +53,11 @@ for backend in backends
     model = parse_basemodelica(testfile("DiscreteCounter"); simplify = false, discrete_backend = backend)
     sys = DyadInterface.simplify_model(model)
     sol = solve(ODEProblem(sys, [], (0.0, 1.0)), Tsit5())
+    value(t) = try
+        sol(t; idxs = sys.y)
+    catch e
+        "error: " * sprint(showerror, e)
+    end
     println(rpad("[$backend] DiscreteCounter", 46), "retcode=", sol.retcode,
-        "  y(0.25)=", sol(0.25; idxs = sys.y), " (expect 0.5)  y(1)=", sol(1.0; idxs = sys.y), " (expect 3)")
+        "  y(0.25)=", value(0.25), " (expect 0.5)  y(1)=", value(1.0), " (expect 3)")
 end
