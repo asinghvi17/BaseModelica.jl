@@ -9,6 +9,33 @@ const antlr4 = Ref{Py}()
 const BaseModelicaLexer = Ref{Py}()
 const BaseModelicaParser = Ref{Py}()
 const BaseModelicaVisitor = Ref{Py}()
+const CollectingErrorListener = Ref{Py}()
+
+# ANTLR's default ConsoleErrorListener prints syntax errors to stderr and lets the parser
+# recover, which yields a parse tree with missing pieces. This listener records every
+# lexer/parser error instead so `parse_with_antlr` can throw.
+const COLLECTING_ERROR_LISTENER_SRC = """
+from antlr4.error.ErrorListener import ErrorListener
+
+class CollectingErrorListener(ErrorListener):
+    def __init__(self):
+        super().__init__()
+        self.errors = []
+
+    def syntaxError(self, recognizer, offendingSymbol, line, column, msg, e):
+        self.errors.append((line, column, msg))
+"""
+
+"""
+    BaseModelicaParseError(msg)
+
+Thrown by the `:antlr` backend when the input contains syntax errors.
+"""
+struct BaseModelicaParseError <: Exception
+    msg::String
+end
+
+Base.showerror(io::IO, e::BaseModelicaParseError) = print(io, "BaseModelicaParseError: ", e.msg)
 
 """
     init_antlr_parser()
@@ -67,6 +94,10 @@ function init_antlr_parser()
         BaseModelicaParser[] = pyimport("BaseModelicaParser").BaseModelicaParser
         BaseModelicaVisitor[] = pyimport("BaseModelicaVisitor").BaseModelicaVisitor
 
+        listener_scope = pydict()
+        pyexec(COLLECTING_ERROR_LISTENER_SRC, listener_scope)
+        CollectingErrorListener[] = listener_scope["CollectingErrorListener"]
+
         @info "ANTLR parser initialized successfully"
         ANTLR_INITIALIZED[] = true
 
@@ -115,24 +146,55 @@ function parse_with_antlr(input::String)
         # Create an input stream from the string
         input_stream = antlr4[].InputStream(input)
 
+        # A single listener collects errors from both the lexer and the parser, replacing
+        # the default listeners that only print to stderr.
+        listener = CollectingErrorListener[]()
+
         # Create lexer
         lexer = BaseModelicaLexer[](input_stream)
+        lexer.removeErrorListeners()
+        lexer.addErrorListener(listener)
 
         # Create token stream
         token_stream = antlr4[].CommonTokenStream(lexer)
 
         # Create parser
         parser = BaseModelicaParser[](token_stream)
+        parser.removeErrorListeners()
+        parser.addErrorListener(listener)
 
         # Parse starting from the root rule (baseModelica)
         parse_tree = parser.baseModelica()
 
+        errors = [
+            (pyconvert(Int, err[0]), pyconvert(Int, err[1]), pyconvert(String, err[2]))
+                for err in listener.errors
+        ]
+        isempty(errors) || throw(BaseModelicaParseError(format_antlr_errors(input, errors)))
+
         return parse_tree
 
     catch e
+        e isa BaseModelicaParseError && rethrow(e)
         @error "Parsing failed" exception = e
         rethrow(e)
     end
+end
+
+# Build an error message listing every syntax error, with source context for the first.
+function format_antlr_errors(source::String, errors)
+    lines = split(source, '\n')
+    line, column, _ = first(errors)
+    # ANTLR columns are 0-based; convert (line, column) to a character offset for context.
+    position = sum(length.(lines[1:(line - 1)]) .+ 1; init = 0) + column
+    listing = join(("  line $l, column $(c + 1): $m" for (l, c, m) in errors), '\n')
+    return """
+    Failed to parse BaseModelica: $(length(errors)) syntax error(s)
+    $listing
+
+    Error context:
+    $(format_error_context(source, position))
+    """
 end
 
 """
@@ -1244,6 +1306,11 @@ function parse_file_antlr(file_path::String)
     end
 
     source = read(file_path, String)
-    parse_tree = parse_with_antlr(source)
+    parse_tree = try
+        parse_with_antlr(source)
+    catch e
+        e isa BaseModelicaParseError || rethrow(e)
+        throw(BaseModelicaParseError("Error in file: $file_path\n" * e.msg))
+    end
     return antlr_tree_to_ast(parse_tree)
 end
