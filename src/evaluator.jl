@@ -52,7 +52,7 @@ function eval_AST(expr::BaseModelicaExpr)
             BaseModelicaGreaterThan(left, right) => f(left) > f(right)
             BaseModelicaEQ(left, right) => f(left) == f(right)
             BaseModelicaNEQ(left, right) => f(left) != f(right)
-            _ => nothing
+            _ => unsupported("expression $(nameof(typeof(expr))) is not supported")
         end
     end
 end
@@ -123,7 +123,7 @@ function get_class_modification_value(modification, key_name::String)
 end
 
 function eval_AST(eq::BaseModelicaSimpleEquation)
-    if eq.lhs isa BaseModelicaIfEquation
+    if eq.lhs isa Union{BaseModelicaIfEquation, BaseModelicaForEquation}
         return eval_AST(eq.lhs)
     end
     if isnothing(eq.rhs) && eq.lhs isa BaseModelicaFunctionCall
@@ -344,6 +344,10 @@ function eval_AST(
     for comp in components
         name = Symbol(comp.component_list[1].declaration.ident[1].name)
         type_prefix = comp.type_prefix.dpc
+        length(comp.component_list) == 1 ||
+            unsupported("component clauses declaring several components are not supported")
+        has_array_subscripts(comp.component_list[1].declaration) &&
+            unsupported("array variable `$name` is not supported")
 
         if type_prefix == "parameter" || haskey(enum_map, comp.type_specifier.type)
             comp.type_specifier.type == "String" && continue
@@ -514,7 +518,12 @@ function eval_AST(
     # Split equations into when-equations (→ events) and regular equations.
     when_equation_list = []
     regular_equations = []
+    initial_algorithms = []
     for eq in equations
+        if eq isa BaseModelicaAlgorithmSection && eq.initial
+            push!(initial_algorithms, eq)
+            continue
+        end
         when_eq = as_when_equation(eq)
         isnothing(when_eq) ? push!(regular_equations, eq) : push!(when_equation_list, when_eq)
     end
@@ -548,6 +557,14 @@ function eval_AST(
     initialization_eqs = Equation[]
     has_free_params = !isempty(free_parameter_names)
     # `pre(v) = value` / `v = value` for a discrete v sets the start value of v
+    for (var, value) in initial_algorithm_assignments(initial_algorithms, composition.annotation)
+        name = symbol_name(var)
+        if name in discrete_variable_names && value isa Number
+            discrete_starts[name] = value
+        else
+            push!(initialization_eqs, var ~ value)
+        end
+    end
     initial_equations = filter(initial_equations) do eq
         name = discrete_initial_target(eq)
         isnothing(name) && return true
@@ -698,6 +715,32 @@ function eval_AST(
     end
 end
 
+"""
+    initial_algorithm_assignments(sections, annotation)
+
+Run `initial algorithm` sections, which may only contain assignments, and return the final
+`variable => value` pairs. Assignments are sequential, so later statements see earlier
+results, and `time` is the experiment start time (0 without an experiment annotation).
+"""
+function initial_algorithm_assignments(sections, annotation)
+    isempty(sections) && return Pair[]
+    experiment = parse_experiment_annotation(annotation)
+    scope = Dict{Symbol, Any}(:time => isnothing(experiment) ? 0.0 : experiment.StartTime)
+    assigned = Symbol[]
+    with_local_scope(scope) do
+        for section in sections, st in section.statements
+            st isa BaseModelicaAssignment && length(st.target.ref_list) == 1 ||
+                unsupported("initial algorithm sections may only contain assignments")
+            name = Symbol(st.target.ref_list[1].name)
+            haskey(variable_map, name) ||
+                unsupported("initial algorithm assigns unknown variable `$name`")
+            scope[name] = eval_AST(st.expression)
+            name in assigned || push!(assigned, name)
+        end
+    end
+    return Pair[variable_map[name] => scope[name] for name in assigned]
+end
+
 # The discrete variable named by the left-hand side of an initial equation `pre(v) = ...`
 # or `v = ...`, or nothing if the equation does not initialize a discrete variable.
 function discrete_initial_target(eq::BaseModelicaInitialEquation)
@@ -722,6 +765,7 @@ function eval_AST(package::BaseModelicaPackage; kwargs...)
         :prefer => Int(StateSelectPrefer),
         :always => Int(StateSelectAlways),
     )
+    register_user_functions!(package.class_defs)
     for class_def in package.class_defs
         if class_def isa BaseModelicaClassDefinition && class_def.class isa BaseModelicaEnumeration
             enum = class_def.class
@@ -738,6 +782,10 @@ function eval_AST(function_args::BaseModelicaFunctionArgs)
 end
 
 function eval_AST(function_call::BaseModelicaFunctionCall)
+    user_function = get(user_function_map, function_call_name(function_call), nothing)
+    if !isnothing(user_function)
+        return inline_user_function(user_function, function_call.args.args)
+    end
     if function_call.func_name isa BaseModelicaComponentReference
         function_name = Symbol(function_call.func_name.ref_list[1].name)
     else
@@ -764,6 +812,12 @@ function eval_AST(comp_reference::BaseModelicaComponentReference)
     #will need to eventually account for array references and dot references...
     #for now only does direct references to variables
     ref_name = Symbol(comp_reference.ref_list[1].name)
+
+    # Function-local variables and for-loop indices
+    scope = LOCAL_SCOPE[]
+    if !isnothing(scope) && length(comp_reference.ref_list) == 1 && haskey(scope, ref_name)
+        return scope[ref_name]
+    end
 
     # Handle special built-in variables
     if ref_name == :time

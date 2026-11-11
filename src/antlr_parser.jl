@@ -383,6 +383,24 @@ function visit_composition(visitor::ASTBuilderVisitor, ctx::Py)
         end
     end
 
+    # Algorithm sections, kept in order among the equations. ctx.statement() would merge
+    # the statements of all sections, so walk the children instead.
+    child_count = pyconvert(Int, ctx.getChildCount())
+    section = nothing
+    for i in 0:(child_count - 1)
+        child = ctx.getChild(i)
+        text = pyconvert(String, child.getText())
+        if text == "algorithm"
+            is_initial = i > 0 && pyconvert(String, ctx.getChild(i - 1).getText()) == "initial"
+            section = BaseModelicaAlgorithmSection([], is_initial)
+            push!(equations, section)
+        elseif text in ("equation", "initial", "external")
+            section = nothing
+        elseif !isnothing(section) && pyhasattr(child, "ifStatement")
+            push!(section.statements, visit_statement(visitor, child))
+        end
+    end
+
     # Get initial equations
     initial_eq_ctxs = ctx.initialEquation()
     if !is_null(initial_eq_ctxs)
@@ -824,6 +842,59 @@ function visit_whenEquation(visitor::ASTBuilderVisitor, ctx::Py)
     return BaseModelicaWhenEquation(whens, thens)
 end
 
+function visit_statements(visitor::ASTBuilderVisitor, ctx::Py)
+    stmt_ctxs = ctx.statement()
+    return is_null(stmt_ctxs) ? [] : [visit_statement(visitor, st) for st in stmt_ctxs]
+end
+
+function visit_statement(visitor::ASTBuilderVisitor, ctx::Py)
+    # statement: decoration? (componentReference (':=' expression | functionCallArgs)
+    #   | '(' outputExpressionList ')' ':=' componentReference functionCallArgs
+    #   | 'break' | 'return' | ifStatement | forStatement | whileStatement | whenStatement)
+    #   comment
+    if !is_null(ctx.ifStatement())
+        if_ctx = ctx.ifStatement()
+        conditions = []
+        branches = []
+        child_count = pyconvert(Int, if_ctx.getChildCount())
+        for i in 0:(child_count - 1)
+            child = if_ctx.getChild(i)
+            text = pyconvert(String, child.getText())
+            if text == "end"
+                break  # 'end' 'if'
+            elseif text == "if" || text == "elseif"
+                push!(conditions, visit_expression(visitor, if_ctx.getChild(i + 1)))
+                push!(branches, [])
+            elseif text == "else"
+                push!(branches, [])
+            elseif pyhasattr(child, "ifStatement") && !isempty(branches)
+                push!(branches[end], visit_statement(visitor, child))
+            end
+        end
+        return BaseModelicaIfStatement(conditions, branches)
+    elseif !is_null(ctx.forStatement())
+        for_ctx = ctx.forStatement()
+        return BaseModelicaForStatement(
+            visit_forIndex(visitor, for_ctx.forIndex()), visit_statements(visitor, for_ctx)
+        )
+    elseif !is_null(ctx.whileStatement())
+        return BaseModelicaUnsupportedStatement("while loop")
+    elseif !is_null(ctx.whenStatement())
+        return BaseModelicaUnsupportedStatement("when statement")
+    elseif !is_null(ctx.outputExpressionList())
+        return BaseModelicaUnsupportedStatement("multiple-output assignment")
+    elseif !is_null(ctx.componentReference())
+        target = visit_componentReference(visitor, ctx.componentReference())
+        if !is_null(ctx.expression())
+            return BaseModelicaAssignment(target, visit_expression(visitor, ctx.expression()))
+        end
+        args = visit_functionCallArgs(visitor, ctx.functionCallArgs())
+        return BaseModelicaFunctionCall(target.ref_list[1], args)
+    end
+    text = get_text(ctx)
+    return BaseModelicaUnsupportedStatement(startswith(text, "break") ? "break" : "return")
+end
+
 # Expression visitors
 function visit_expression(visitor::ASTBuilderVisitor, ctx::Py)
     # expression: expressionNoDecoration decoration?
@@ -1129,9 +1200,8 @@ function visit_primary(visitor::ASTBuilderVisitor, ctx::Py)
 
         if !is_null(ctx.functionCallArgs())
             args = visit_functionCallArgs(visitor, ctx.functionCallArgs())
-            # Extract function name from component reference
-            func_name = comp_ref.ref_list[1]  # Simplified - assumes simple name
-            return BaseModelicaFunctionCall(func_name, args)
+            # Keep the full (possibly dotted) name, as the :julia parser does
+            return BaseModelicaFunctionCall(comp_ref, args)
         else
             return comp_ref
         end
@@ -1143,9 +1213,18 @@ function visit_primary(visitor::ASTBuilderVisitor, ctx::Py)
             # Tuple
             return expr_list
         end
+    elseif !is_null(ctx.arrayArguments())
+        # '{' arrayArguments '}'
+        args_ctx = ctx.arrayArguments()
+        if !is_null(args_ctx.forIndex())
+            return BaseModelicaUnsupportedExpression("array comprehension {... for ...}")
+        end
+        return BaseModelicaArrayConstructor(
+            [visit_expression(visitor, e) for e in args_ctx.expression()]
+        )
     else
-        # Array or other constructs
-        return BaseModelicaNumber(0.0)  # Placeholder
+        # '[' expressionList (';' expressionList)* ']'
+        return BaseModelicaUnsupportedExpression("matrix constructor [...]")
     end
 end
 

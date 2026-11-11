@@ -92,6 +92,31 @@ end
         @test last(sol.ps[sys.d]) == 6.0
     end
 
+    @testset "Discrete start value from initial algorithm ($parser)" for parser in (:julia, :antlr)
+        path = write_model(
+            """
+                Real 'x'(fixed = true, start = 0.0);
+                discrete Real 'd';
+                discrete Real 'e';
+              equation
+                der('x') = 1.0;
+                when 'x' > 0.5 then
+                  'd' = pre('d') + 1.0;
+                  'e' = pre('e') * 2.0;
+                end when;
+              initial algorithm
+                'd' := integer((time + 2.5) / 1.0);
+                'e' := 'd' + 1.0;
+            """
+        )
+        sys = parse_basemodelica(path; parser, discrete_backend = :mtk)
+        sol = solve(ODEProblem(sys, [], (0.0, 1.0)), Tsit5())
+        @test first(sol.ps[sys.d]) == 2.0
+        @test first(sol.ps[sys.e]) == 3.0
+        @test last(sol.ps[sys.d]) == 3.0
+        @test last(sol.ps[sys.e]) == 6.0
+    end
+
     @testset "Unsupported constructs throw" begin
         reinit_outside = write_model(
             """

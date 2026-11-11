@@ -25,6 +25,7 @@ include("julia_parser.jl")
 include("antlr_parser.jl")
 include("events.jl")
 include("evaluator.jl")
+include("functions.jl")
 
 """
     parse_basemodelica(filename::AbstractString; parser::Symbol = :antlr,
@@ -40,9 +41,8 @@ Parse a BaseModelica source file into a ModelingToolkit system.
   `:julia` uses the ParserCombinator implementation.
 - `discrete_backend = :auto`: How discrete variables and `when` equations are lowered.
   `:mtk` uses ModelingToolkit symbolic events (`@discretes` updated by callback affects).
-  `:synchtoolkit` uses clocked variables compiled by SynchToolkit.jl and requires
-  `using SynchToolkit`. `:auto` picks `:synchtoolkit` when SynchToolkit.jl is loaded and
-  `:mtk` otherwise.
+  `:synchtoolkit` (experimental) uses clocked variables compiled by SynchToolkit.jl and
+  requires `using SynchToolkit`. `:auto` currently selects `:mtk`.
 - `simplify = true`: `true` returns the system compiled with `mtkcompile` (plus the
   SynchToolkit pass when that backend is used). `false` returns the unsimplified system, for
   example to pass to `DyadInterface.simplify_model`. A function `f` returns `f(system)`.

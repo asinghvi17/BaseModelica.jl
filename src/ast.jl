@@ -41,6 +41,12 @@ end
     #Class types
     BaseModelicaClassDefinition(class_type, class)
     BaseModelicaEnumeration(name, values)  # name: String, values: Vector{String}
+    # Algorithm sections and statements
+    BaseModelicaAlgorithmSection(statements, initial) # initial::Bool for `initial algorithm`
+    BaseModelicaAssignment(target, expression)  # target := expression
+    BaseModelicaIfStatement(conditions, branches)  # branches[end] is the else branch if longer
+    BaseModelicaForStatement(index, statements)
+    BaseModelicaUnsupportedStatement(description)  # parsed but not convertible (while, when, ...)
 end
 
 @data BaseModelicaExpr <: BaseModelicaASTNode begin
@@ -106,4 +112,6 @@ end
     BaseModelicaNEQ(left, right)
     BaseModelicaIfExpression(conditions, expressions)
     BaseModelicaArrayReference(term, indexes)
+    BaseModelicaArrayConstructor(elements)  # {a, b, c}
+    BaseModelicaUnsupportedExpression(description)  # parsed but not convertible
 end
