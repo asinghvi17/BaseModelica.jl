@@ -12,7 +12,32 @@
 A parser for the [Base Modelica](https://github.com/modelica/ModelicaSpecification/tree/MCP/0031/RationaleMCP/0031) format. Contains utilities to parse Base Modelica model files in to Julia objects, and to convert Base Modelica models to [ModelingToolkit](https://docs.sciml.ai/ModelingToolkit/stable/) models.
 
 Base Modelica is as of yet only a proposal with no concrete specification, so the grammar and features of the language are subject to change.
-There is no support for Records, custom types, or custom functions. Any [built in BaseModelica functions](https://github.com/modelica/ModelicaSpecification/blob/MCP/0031/RationaleMCP/0031/functions.md) are not yet supported. Array variables and accessing elements of an array are not yet supported. Only models with real scalar parameters, real scalar variables, and equations consisting of simple arithmetic equations and first order derivatives are able to be translated to an MTK model at this time.
+
+## Supported features
+
+- Real, Integer, Boolean and enumeration scalar variables, parameters and constants, with
+  `start`/`fixed` attributes, `stateSelect`, initial equations and `parameter equation` guesses.
+- Equations with arithmetic, relational and logical operators, `if`-expressions and
+  `if`-equations, the built-in functions listed in `src/maps.jl` (including `der`, `pre`,
+  `delay`, `noEvent`, `smooth`, `homotopy`), and scalar `for`-equations over constant ranges.
+- `when`/`elsewhen` equations. A rising-edge condition (a relation or a Boolean variable)
+  becomes a ModelingToolkit `SymbolicContinuousCallback`, and `sample(0, dt)` becomes a
+  periodic `SymbolicDiscreteCallback`. In the body, `v = expr` updates a discrete variable
+  and `reinit(x, expr)` resets a continuous state. `pre(v)` and continuous variables read
+  their pre-event values.
+  With `using SynchToolkit` and `discrete_backend = :synchtoolkit` (experimental), discrete
+  variables are instead clocked variables on an `EventClock`/`Clock`, compiled by
+  SynchToolkit.jl.
+- User-defined functions with an `algorithm` section (`:=`, `if` and `for` statements over
+  constant ranges). They are inlined symbolically into the equations.
+- `{...}` array constructors as arguments of functions such as `sum`.
+
+Not supported: array variables, records, matrix constructors `[...]`, algorithm sections
+in models, `while` loops, multiple-output function calls, external functions, compound
+`when` conditions (`a and b`) and `edge`/`change`/`initial()`. These raise a
+`BaseModelica.UnsupportedFeatureError` instead of producing a different model. Syntax
+errors raise `BaseModelica.BaseModelicaParseError` (`:antlr`) or a
+`ParserCombinator.ParserException` (`:julia`).
 
 ## Installation
 
@@ -44,7 +69,6 @@ end 'FirstOrder';
 To parse the model in the file to ModelingToolkit, use the `parse_basemodelica` function:
 
 ```julia
-```julia
 using BaseModelica
 
 sys = parse_basemodelica("path/to/ExampleFirstOrder.bmo")
@@ -68,3 +92,23 @@ annotation(experiment(StartTime = 0, StopTime = 2.0, Tolerance = 1e-06, Interval
 ```
 
 The time span, relative tolerance, and save interval will be automatically configured from the annotation.
+The settings are also stored on the system returned by `parse_basemodelica` and can be
+read with `experiment_settings(sys)`.
+
+## Unsimplified systems and Dyad
+
+By default `parse_basemodelica` returns a system already compiled with `mtkcompile`.
+Pass `simplify = false` to get the unsimplified `System`, for example to use the Dyad
+pipeline (`DyadInterface.simplify_model` also adds the SynchToolkit pass when SynchToolkit
+is loaded):
+
+```julia
+using BaseModelica, DyadInterface
+
+model = parse_basemodelica("BouncingBall.bmo"; simplify = false)
+settings = experiment_settings(model)
+result = TransientAnalysis(; model, stop = settings.StopTime)
+
+# or build the problem yourself:
+prob = create_odeproblem("BouncingBall.bmo"; simplify = DyadInterface.simplify_model)
+```
