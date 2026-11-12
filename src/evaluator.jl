@@ -304,7 +304,7 @@ function extract_time_threshold(cond_ast)
 end
 
 function eval_AST(
-        model::BaseModelicaModel; backend::DiscreteBackend = MTKEventsBackend(),
+        model::BaseModelicaModel; backend::AbstractDiscreteBackend = MTKEventsBackend(),
         simplify = true
     )
     empty!(variable_map)
@@ -313,7 +313,6 @@ function eval_AST(
     empty!(free_parameter_names)
     empty!(tstops_collection)
     empty!(bool_comparison_names)
-    CURRENT_BACKEND[] = backend
 
     class_specifier = model.long_class_specifier
 
@@ -681,11 +680,13 @@ function eval_AST(
     bindings = [variable_map[name] => missing for name in free_parameter_names]
 
     # Lower when-equations through the discrete backend.
-    discrete_start_pairs = [variable_map[name] => value for (name, value) in discrete_starts]
-    lowered = lower_when_clauses(
-        backend, when_clause_list, differentiated_variables(real_eqs), discrete_start_pairs
+    discrete_model = DiscreteModel(
+        real_eqs, copy(vars), differentiated_variables(real_eqs),
+        Pair{Any, Any}[variable_map[name] => discrete_starts[name] for name in sort!(collect(keys(discrete_starts)))],
+        when_blocks(when_clause_list)
     )
-    append!(real_eqs, lowered.equations)
+    lowered = lower_discrete(backend, discrete_model)
+    real_eqs = lowered.equations
 
     # Discrete variables that the backend represents as (clocked) unknowns
     for name in discrete_variable_names
@@ -798,8 +799,7 @@ function eval_AST(function_call::BaseModelicaFunctionCall)
     end
 
     if function_name == :pre
-        arg = with_eval_mode(() -> eval_AST(only(function_call.args.args)), :raw)
-        return apply_pre(arg)
+        return apply_pre(eval_AST(only(function_call.args.args)))
     end
 
     haskey(function_map, function_name) ||
@@ -836,8 +836,7 @@ function eval_AST(comp_reference::BaseModelicaComponentReference)
         end
     end
 
-    sym = get(variable_map, ref_name, nothing)
-    return isnothing(sym) ? nothing : apply_reference_mode(sym)
+    return get(variable_map, ref_name, nothing)
 end
 
 """

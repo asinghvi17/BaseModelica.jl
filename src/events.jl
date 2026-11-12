@@ -1,13 +1,12 @@
 # Lowering of Modelica `when` equations (discrete assignments and `reinit`) to
-# ModelingToolkit. A `when` equation is first collected into a backend-independent
-# `WhenClause`; a `DiscreteBackend` then turns the clauses into MTK equations and events.
+# ModelingToolkit. BaseModelica evaluates the when-equations into a backend-independent,
+# symbolic `DiscreteModel`; an `AbstractDiscreteBackend` then turns it into MTK equations,
+# events and initial conditions.
 #
-# Two backends exist:
-# - `MTKEventsBackend` (built in): discrete variables are `@discretes` updated by the
-#   affect of a `SymbolicContinuousCallback` (zero crossings) or a periodic
-#   `SymbolicDiscreteCallback` (`sample`).
-# - `SynchToolkitBackend` (package extension, loaded with SynchToolkit.jl): discrete
-#   variables are clocked variables on an `EventClock`/`Clock` compiled by SynchToolkit.
+# The built-in `MTKEventsBackend` (`:mtk`) uses ModelingToolkit symbolic events. Other
+# backends live in other packages and register themselves under a name with
+# `register_discrete_backend!` (for example SynchToolkit.jl registers `:synchtoolkit` from
+# its `SynchToolkitBaseModelicaExt` extension).
 
 """
     UnsupportedFeatureError(msg)
@@ -27,17 +26,12 @@ end
 unsupported(msg) = throw(UnsupportedFeatureError(msg))
 
 # ── Evaluation modes ──────────────────────────────────────────────────────────
-# The meaning of a variable reference and of `pre(x)` depends on where it appears:
-#   :normal    continuous equations; discrete variables go through
-#              `discrete_reference` (e.g. `Hold` for clocked variables)
-#   :raw       plain symbols, no rewriting (used for the argument of `pre`)
+# The meaning of `pre(x)` depends on where it appears:
+#   :normal    continuous equations; `pre(v)` of a discrete variable is `v` (they differ
+#              only at event instants), otherwise `Pre(x)`
 #   :condition when-conditions; `pre(x)` is the current value of `x`
-#   :affect    MTK callback affects; continuous variables read their pre-event value
-#   :clocked   clocked (SynchToolkit) equations; see `clocked_reference`/`clocked_pre`
+#   :event     when-bodies; `pre(x)` is `Pre(x)`, the value just before the event
 const EVAL_MODE = Ref(:normal)
-const CURRENT_BACKEND = Ref{Any}(nothing)
-# Backend-specific data for the clause being lowered (e.g. the `ShiftIndex`).
-const CLOCK_CONTEXT = Ref{Any}(nothing)
 
 function with_eval_mode(f, mode::Symbol)
     old = EVAL_MODE[]
@@ -71,37 +65,19 @@ function symbol_name(sym)
     end
 end
 
-# Rewrite a resolved variable reference according to the current evaluation mode.
-function apply_reference_mode(sym)
-    mode = EVAL_MODE[]
-    if mode === :normal
-        is_discrete_variable(sym) && return discrete_reference(CURRENT_BACKEND[], sym)
-    elseif mode === :affect
-        is_continuous_variable(sym) && return ModelingToolkit.Pre(sym)
-    elseif mode === :clocked
-        return clocked_reference(CURRENT_BACKEND[], sym)
-    end
-    return sym
-end
-
 # `pre(x)` evaluated in the current mode; `arg` is the plain symbol for `x`.
 function apply_pre(arg)
     mode = EVAL_MODE[]
-    if mode === :condition
-        return arg
-    elseif mode === :clocked
-        return clocked_pre(CURRENT_BACKEND[], arg)
-    elseif mode === :normal && is_discrete_variable(arg)
-        # Outside of events pre(x) equals x (they differ only at event instants)
-        return discrete_reference(CURRENT_BACKEND[], arg)
-    end
+    mode === :condition && return arg
+    mode === :normal && is_discrete_variable(arg) && return arg
     return ModelingToolkit.Pre(arg)
 end
 
 # ── When-clause IR ────────────────────────────────────────────────────────────
 
 """
-One branch (`when` or `elsewhen`) of a `when` equation.
+One branch (`when` or `elsewhen`) of a `when` equation, as AST. Internal; backends receive
+the evaluated [`WhenBlock`](@ref)s instead.
 
 - `condition`: the condition AST.
 - `sample`: `nothing`, or `(start, interval)` when the condition is `sample(start, interval)`.
@@ -166,7 +142,10 @@ function when_clauses(when_eq::BaseModelicaWhenEquation)
             inner = inner_equation(eq)
             if inner isa BaseModelicaSimpleEquation && inner.lhs isa BaseModelicaComponentReference &&
                     !isnothing(inner.rhs)
-                push!(assignments, (resolve_variable(inner.lhs), inner.rhs))
+                var = resolve_variable(inner.lhs)
+                is_discrete_variable(var) ||
+                    unsupported("assignment to `$(symbol_name(var))` in a when-equation; only discrete variables can be assigned")
+                push!(assignments, (var, inner.rhs))
             elseif inner isa BaseModelicaSimpleEquation && inner.lhs isa BaseModelicaFunctionCall &&
                     isnothing(inner.rhs)
                 fname = function_call_name(inner.lhs)
@@ -229,8 +208,6 @@ function to_zero_crossing(cond)
     end
 end
 
-when_crossing(clause::WhenClause) =
-    to_zero_crossing(with_eval_mode(() -> eval_AST(clause.condition), :condition))
 
 # Variables appearing under a time derivative in `eqs`: the continuous states.
 function differentiated_variables(eqs)
@@ -252,110 +229,186 @@ function differentiated_variables(eqs)
     return found
 end
 
-# ── Backend interface ─────────────────────────────────────────────────────────
+
+# ── Discrete backend interface ────────────────────────────────────────────────
 
 """
-Strategy for lowering discrete variables and `when` equations. See `MTKEventsBackend`.
+    WhenBlock
+
+The evaluated body of every `when`/`elsewhen` branch that shares one trigger. Branches with
+an identical zero-crossing (or identical `sample(start, interval)`) fire at the same
+instant, so BaseModelica merges them into one block.
+
+All expressions are symbolic, built from the symbols of [`DiscreteModel`](@ref):
+
+- `condition`: the Boolean condition, e.g. `h(t) < 0`, with `pre(x)` evaluated as `x`.
+  `nothing` for a `sample` trigger.
+- `crossing`: an expression that crosses zero upwards when `condition` becomes true, e.g.
+  `-h(t)` for `h < 0`. The block fires on that rising edge only. `nothing` for a `sample`
+  trigger.
+- `sample`: `nothing`, or `(start, interval)` for `when sample(start, interval)`.
+- `assignments`: `v => rhs` for each `v = rhs` in the body; `v` is a discrete variable.
+- `reinits`: `x => rhs` for each `reinit(x, rhs)`; `x` is a continuous state, and no
+  state appears twice in one block.
+
+In `rhs`, `pre(x)` is `ModelingToolkit.Pre(x)` (the value just before the event), for
+discrete and continuous `x` alike. Any other variable appears as its plain symbol: a plain
+discrete `v` means its new value at this event, a plain continuous `x` means its value at
+the event instant (which equals its pre-event value).
 """
-abstract type DiscreteBackend end
+struct WhenBlock
+    condition::Any
+    crossing::Any
+    sample::Union{Nothing, Tuple{Float64, Float64}}
+    assignments::Vector{Pair{Any, Any}}
+    reinits::Vector{Pair{Any, Any}}
+end
 
 """
-    LoweredEvents
+    DiscreteModel
 
-Result of `lower_when_clauses`: equations, events and initial conditions to add to the
-`System`.
+What BaseModelica hands to [`lower_discrete`](@ref): the continuous part of the model plus
+its discrete variables and `when` equations, all as ModelingToolkit symbolics.
+
+- `equations::Vector{Equation}`: the continuous equations (`der(x) = ...`, algebraic
+  equations, declaration equations). Discrete variables appear as their plain symbols, and
+  `pre(v)` of a discrete `v` is already rewritten to `v`.
+- `variables::Vector`: the continuous unknowns, e.g. `x(t)`.
+- `states::Vector`: the subset of `variables` that appear under `der`.
+- `discretes::Vector{Pair}`: `v => start` for each discrete variable, where `v` is the
+  symbol returned by [`declare_discrete`](@ref) and `start` is the value of `pre(v)` at
+  the first event: the `start` attribute, an initial equation `pre(v) = c` or `v = c`, an
+  `initial algorithm` assignment, or the Modelica default 0 (`false` for Booleans).
+- `when_blocks::Vector{WhenBlock}`: see [`WhenBlock`](@ref), in model order.
+
+Initial equations, parameters and Boolean relation variables (`off = s < 0`) are handled by
+BaseModelica and are not part of the `DiscreteModel`.
 """
-Base.@kwdef struct LoweredEvents
-    equations::Vector{Equation} = Equation[]
+struct DiscreteModel
+    equations::Vector{Equation}
+    variables::Vector{Any}
+    states::Vector{Any}
+    discretes::Vector{Pair{Any, Any}}
+    when_blocks::Vector{WhenBlock}
+end
+
+"""
+    LoweredDiscrete(; equations, continuous_events = [], discrete_events = [],
+                    initial_conditions = [], initialization_eqs = [])
+
+What [`lower_discrete`](@ref) returns. BaseModelica builds the `System` from it:
+
+- `equations`: every equation of the system, replacing `DiscreteModel.equations` (return
+  those unchanged if the backend does not rewrite them).
+- `continuous_events`, `discrete_events`: passed to `System`.
+- `initial_conditions`: `variable => value` pairs, passed as `initial_conditions`.
+- `initialization_eqs`: added to the model's own initialization equations.
+"""
+Base.@kwdef struct LoweredDiscrete
+    equations::Vector{Equation}
     continuous_events::Vector{Any} = Any[]
     discrete_events::Vector{Any} = Any[]
     initial_conditions::Vector{Pair} = Pair[]
     initialization_eqs::Vector{Equation} = Equation[]
 end
 
-# Symbol for a discrete variable called `name`.
-function declare_discrete end
-# Reference to discrete variable `sym` from a continuous equation.
-function discrete_reference end
-# Lower the when-clauses; `states` are the continuous states of the model.
-function lower_when_clauses end
-# Turn the assembled System into a simplified one.
-function compile_system end
-# Variable reference / `pre` inside clocked equations (SynchToolkit backend only).
-function clocked_reference end
-function clocked_pre end
+"""
+    AbstractDiscreteBackend
+
+Supertype of the strategies that lower Base Modelica discrete variables and `when`
+equations to ModelingToolkit. Select one with the `discrete_backend` keyword of
+[`parse_basemodelica`](@ref) and [`create_odeproblem`](@ref), either by passing an instance
+or by the name it was registered under with [`register_discrete_backend!`](@ref).
+
+A backend `B <: AbstractDiscreteBackend` implements:
+
+- [`lower_discrete`](@ref)`(::B, model::DiscreteModel) -> LoweredDiscrete` (required).
+- [`declare_discrete`](@ref)`(::B, name::Symbol)` (optional): the symbol for a discrete
+  variable. Defaults to `@discretes name(t)`.
+- [`compile_system`](@ref)`(::B, sys)` (optional): the simplification used for
+  `simplify = true`. Defaults to `mtkcompile(sys)`.
+
+Backends that throw for constructs they cannot represent should throw
+[`UnsupportedFeatureError`](@ref).
+
+The built-in backend is [`MTKEventsBackend`](@ref), registered as `:mtk`.
+"""
+abstract type AbstractDiscreteBackend end
+
+"""
+    declare_discrete(backend::AbstractDiscreteBackend, name::Symbol)
+
+Return the ModelingToolkit symbol that represents the discrete variable `name`, a function
+of the independent variable `ModelingToolkit.t_nounits`. Called once per discrete variable
+while the model is read, before [`lower_discrete`](@ref). If the returned symbol is not a
+parameter, BaseModelica adds it to the unknowns of the system.
+
+The default returns `@discretes name(t)`, a discrete parameter updated by event affects.
+"""
+declare_discrete(::AbstractDiscreteBackend, name::Symbol) = only(@discretes($name(t)))
+
+"""
+    lower_discrete(backend::AbstractDiscreteBackend, model::DiscreteModel) -> LoweredDiscrete
+
+Lower the discrete part of `model` (see [`DiscreteModel`](@ref)): return the equations,
+events and initial conditions of the system as a [`LoweredDiscrete`](@ref). Every backend
+must implement this method.
+"""
+function lower_discrete end
+
+"""
+    compile_system(backend::AbstractDiscreteBackend, sys)
+
+Simplify the assembled `System` when [`parse_basemodelica`](@ref) is called with
+`simplify = true`. The default is `mtkcompile(sys)`; a backend that needs extra compiler
+passes overrides it. With `simplify = false` or a function, this method is not called.
+"""
+compile_system(::AbstractDiscreteBackend, sys) = mtkcompile(sys)
 
 """
     MTKEventsBackend()
 
-Lower `when` equations to ModelingToolkit symbolic events. Discrete variables are
-`@discretes`; each `when` condition becomes a `SymbolicContinuousCallback` that fires on
-the rising edge, `sample(start, interval)` becomes a periodic `SymbolicDiscreteCallback`.
+The built-in discrete backend, registered as `:mtk` (the default). Discrete variables are
+`@discretes`; each `when` trigger becomes a `SymbolicContinuousCallback` that fires on the
+rising edge, and `sample(0, interval)` becomes a periodic `SymbolicDiscreteCallback`.
 Assignments and `reinit` become affect equations in which continuous variables read their
 pre-event value (`Pre`).
 """
-struct MTKEventsBackend <: DiscreteBackend end
+struct MTKEventsBackend <: AbstractDiscreteBackend end
 
-declare_discrete(::MTKEventsBackend, name::Symbol) = only(@discretes($name(t)))
-discrete_reference(::MTKEventsBackend, sym) = sym
-compile_system(::MTKEventsBackend, sys) = mtkcompile(sys)
-
-function lower_when_clauses(backend::MTKEventsBackend, clauses, states, discrete_starts)
-    lowered = LoweredEvents()
-    for (sym, start) in discrete_starts
-        push!(lowered.initial_conditions, sym => start)
-    end
-    crossings, grouped = group_by_crossing(filter(c -> isnothing(c.sample), clauses))
-    for clause in filter(c -> !isnothing(c.sample), clauses)
-        clause.sample[1] == 0 ||
-            unsupported("sample(start, interval) with start ≠ 0 needs discrete_backend = :synchtoolkit")
-        affects, discretes = mtk_affect(backend, [clause], states)
-        push!(
-            lowered.discrete_events, ModelingToolkitBase.SymbolicDiscreteCallback(
-                clause.sample[2], affects; discrete_parameters = discretes
+function lower_discrete(::MTKEventsBackend, model::DiscreteModel)
+    lowered = LoweredDiscrete(;
+        equations = model.equations,
+        initial_conditions = Pair[sym => start for (sym, start) in model.discretes]
+    )
+    for block in model.when_blocks
+        affects, discretes = mtk_affect(block, model)
+        if isnothing(block.sample)
+            # `affect_neg = nothing`: fire only when the condition becomes true (rising edge).
+            push!(
+                lowered.continuous_events, ModelingToolkitBase.SymbolicContinuousCallback(
+                    Equation[block.crossing ~ 0], affects;
+                    affect_neg = nothing, discrete_parameters = discretes
+                )
             )
-        )
-    end
-    for (crossing, group) in zip(crossings, grouped)
-        affects, discretes = mtk_affect(backend, group, states)
-        # `affect_neg = nothing`: fire only when the condition becomes true (rising edge).
-        push!(
-            lowered.continuous_events, ModelingToolkitBase.SymbolicContinuousCallback(
-                Equation[crossing ~ 0], affects;
-                affect_neg = nothing, discrete_parameters = discretes
+        else
+            start, interval = block.sample
+            start == 0 ||
+                unsupported("sample(start, interval) with start ≠ 0 is not supported by the :mtk discrete backend")
+            push!(
+                lowered.discrete_events, ModelingToolkitBase.SymbolicDiscreteCallback(
+                    interval, affects; discrete_parameters = discretes
+                )
             )
-        )
+        end
     end
     return lowered
 end
 
 """
-    group_by_crossing(clauses)
+    mtk_affect(block, model)
 
-Group zero-crossing clauses by their crossing function. Returns `(crossings, groups)`.
-Clauses with the same crossing must share one event: separate callbacks with identical
-roots do not all fire at the same instant.
-"""
-function group_by_crossing(clauses)
-    crossings = Any[]
-    grouped = Vector{Vector{WhenClause}}()
-    for clause in clauses
-        crossing = when_crossing(clause)
-        idx = findfirst(c -> isequal(c, crossing), crossings)
-        if isnothing(idx)
-            push!(crossings, crossing)
-            push!(grouped, [clause])
-        else
-            push!(grouped[idx], clause)
-        end
-    end
-    return crossings, grouped
-end
-
-"""
-    mtk_affect(backend, clauses, states)
-
-Affect equations for `clauses`, which fire together. Returns `(affects, discrete_parameters)`.
+Affect equations for `block`. Returns `(affects, discrete_parameters)`.
 
 Continuous variables are read through `Pre`, matching Modelica: inside an event they keep
 their pre-event value, and `reinit` takes effect only after the event. Every state not
@@ -363,55 +416,156 @@ reinitialized is held with `x ~ Pre(x)`; MTK solves the affect together with the
 equations of the model, and without these equations states that are not assigned are
 treated as free unknowns of that system.
 """
-function mtk_affect(::MTKEventsBackend, clauses, states)
-    affects = Equation[]
-    discretes = []
-    reinit_targets = []
-    with_eval_mode(:affect) do
-        for clause in clauses
-            for (var, rhs) in clause.assignments
-                is_discrete_variable(var) ||
-                    unsupported("assignment to `$(symbol_name(var))` in a when-equation; only discrete variables can be assigned")
-                push!(affects, var ~ eval_AST(rhs))
-                push!(discretes, var)
-            end
-            for (state, rhs) in clause.reinits
-                any(isequal(state), reinit_targets) &&
-                    unsupported("`$(symbol_name(state))` is reinitialized twice in the same event")
-                push!(affects, state ~ eval_AST(rhs))
-                push!(reinit_targets, state)
-            end
-        end
+function mtk_affect(block::WhenBlock, model::DiscreteModel)
+    pre_values = Dict{Any, Any}()
+    for x in model.variables
+        pre_values[x] = ModelingToolkit.Pre(x)
+        pre_values[ModelingToolkit.Pre(x)] = ModelingToolkit.Pre(x)
     end
-    for state in states
-        any(isequal(state), reinit_targets) || push!(affects, state ~ ModelingToolkit.Pre(state))
+    event_value(rhs) = Symbolics.substitute(rhs, pre_values; fold = Val(false))
+    affects = Equation[var ~ event_value(rhs) for (var, rhs) in block.assignments]
+    discretes = unique(first.(block.assignments))
+    for (state, rhs) in block.reinits
+        push!(affects, state ~ event_value(rhs))
+    end
+    for state in model.states
+        any(r -> isequal(first(r), state), block.reinits) ||
+            push!(affects, state ~ ModelingToolkit.Pre(state))
     end
     return affects, discretes
 end
 
-# ── Backend selection ─────────────────────────────────────────────────────────
-
 """
-    synchtoolkit_backend()
+    when_blocks(clauses)
 
-Return the SynchToolkit discrete backend. The method is defined by the
-`BaseModelicaSynchToolkitExt` extension, so it exists only when SynchToolkit.jl is loaded.
+Evaluate the AST-level `WhenClause`s into [`WhenBlock`](@ref)s, merging clauses that share
+a trigger: separate callbacks with identical roots do not all fire at the same instant.
 """
-function synchtoolkit_backend end
-
-# `:auto` currently always selects the MTK backend: the SynchToolkit backend is opt-in while
-# it has known gaps (see the extension). Loading SynchToolkit never changes results on its own.
-function select_backend(backend)
-    backend isa DiscreteBackend && return backend
-    has_synch = applicable(synchtoolkit_backend)
-    if backend === :auto
-        return MTKEventsBackend()
-    elseif backend === :mtk
-        return MTKEventsBackend()
-    elseif backend === :synchtoolkit
-        has_synch ||
-            error("discrete_backend = :synchtoolkit requires SynchToolkit.jl to be loaded (`using SynchToolkit`)")
-        return synchtoolkit_backend()
+function when_blocks(clauses)
+    blocks = WhenBlock[]
+    for clause in clauses
+        condition = crossing = nothing
+        if isnothing(clause.sample)
+            condition = with_eval_mode(() -> eval_AST(clause.condition), :condition)
+            crossing = to_zero_crossing(condition)
+        end
+        assignments, reinits = with_eval_mode(:event) do
+            Pair{Any, Any}[var => eval_AST(rhs) for (var, rhs) in clause.assignments],
+                Pair{Any, Any}[state => eval_AST(rhs) for (state, rhs) in clause.reinits]
+        end
+        idx = findfirst(b -> isequal(b.crossing, crossing) && b.sample == clause.sample, blocks)
+        if isnothing(idx)
+            push!(blocks, WhenBlock(condition, crossing, clause.sample, assignments, reinits))
+        else
+            append!(blocks[idx].assignments, assignments)
+            append!(blocks[idx].reinits, reinits)
+        end
     end
-    return error("Unknown discrete_backend $(repr(backend)). Use :auto, :mtk or :synchtoolkit")
+    for block in blocks
+        states = first.(block.reinits)
+        for (i, state) in enumerate(states)
+            any(isequal(state), states[1:(i - 1)]) &&
+                unsupported("`$(symbol_name(state))` is reinitialized twice in the same event")
+        end
+    end
+    return blocks
+end
+
+# ── Backend registry ──────────────────────────────────────────────────────────
+
+const DISCRETE_BACKENDS = Dict{Symbol, AbstractDiscreteBackend}(:mtk => MTKEventsBackend())
+# Names of the registered backends that `discrete_backend = :auto` may select.
+const AUTO_BACKENDS = Set{Symbol}()
+const DISCRETE_BACKENDS_LOCK = ReentrantLock()
+# Packages known to provide a backend, used only for the error message when a backend is
+# requested but not registered.
+const BACKEND_PROVIDERS = Dict(:synchtoolkit => "SynchToolkit")
+
+"""
+    register_discrete_backend!(name::Symbol, backend::AbstractDiscreteBackend; auto = false)
+
+Make `backend` available as `discrete_backend = name`. Packages that provide a backend call
+this from `__init__` (of the package or of its BaseModelica extension), not at the top
+level, so that the registration also happens when the package is loaded from a
+precompiled image. Registering a name again replaces the previous backend.
+
+With `auto = true` the backend is also chosen by `discrete_backend = :auto` (the default)
+while it is registered. If several registered backends set `auto = true`, `:auto` throws
+and the backend must be chosen by name. `:mtk` and `:auto` are reserved.
+
+Returns `backend`.
+
+## Examples
+
+```julia
+struct MyBackend <: BaseModelica.AbstractDiscreteBackend end
+BaseModelica.lower_discrete(::MyBackend, model) =
+    BaseModelica.lower_discrete(BaseModelica.MTKEventsBackend(), model)
+
+function __init__()
+    BaseModelica.register_discrete_backend!(:mine, MyBackend())
+end
+```
+"""
+function register_discrete_backend!(
+        name::Symbol, backend::AbstractDiscreteBackend; auto::Bool = false
+    )
+    name in (:mtk, :auto) &&
+        throw(ArgumentError("discrete backend name :$name is reserved"))
+    @lock DISCRETE_BACKENDS_LOCK begin
+        DISCRETE_BACKENDS[name] = backend
+        auto ? push!(AUTO_BACKENDS, name) : delete!(AUTO_BACKENDS, name)
+    end
+    return backend
+end
+
+"""
+    unregister_discrete_backend!(name::Symbol)
+
+Remove the backend registered under `name`, if any. `:mtk` cannot be removed.
+"""
+function unregister_discrete_backend!(name::Symbol)
+    name === :mtk && throw(ArgumentError("the :mtk discrete backend cannot be unregistered"))
+    @lock DISCRETE_BACKENDS_LOCK begin
+        delete!(DISCRETE_BACKENDS, name)
+        delete!(AUTO_BACKENDS, name)
+    end
+    return nothing
+end
+
+"""
+    select_backend(discrete_backend)
+
+Resolve the `discrete_backend` keyword: an `AbstractDiscreteBackend` is used as is, a name
+is looked up among the registered backends. `:auto` selects the one registered backend
+with `auto = true`, or `:mtk` if there is none.
+"""
+function select_backend(backend)
+    backend isa AbstractDiscreteBackend && return backend
+    backend isa Symbol ||
+        throw(ArgumentError("discrete_backend must be a Symbol or an AbstractDiscreteBackend, got $(repr(backend))"))
+    return @lock DISCRETE_BACKENDS_LOCK begin
+        if backend === :auto
+            candidates = sort!(collect(AUTO_BACKENDS))
+            length(candidates) > 1 && throw(
+                ArgumentError(
+                    "discrete_backend = :auto is ambiguous: the backends $(join(repr.(candidates), ", ")) all " *
+                        "asked to be selected automatically. Pass one of them explicitly."
+                )
+            )
+            return DISCRETE_BACKENDS[isempty(candidates) ? :mtk : only(candidates)]
+        end
+        haskey(DISCRETE_BACKENDS, backend) && return DISCRETE_BACKENDS[backend]
+        registered = join(repr.(sort!(collect(keys(DISCRETE_BACKENDS)))), ", ")
+        provider = get(BACKEND_PROVIDERS, backend, nothing)
+        hint = isnothing(provider) ?
+            "Backends are provided by packages; load the package that provides it." :
+            "It is provided by $provider.jl: load $provider to enable it (`using $provider`)."
+        throw(
+            ArgumentError(
+                "No discrete backend is registered as discrete_backend = $(repr(backend)). $hint " *
+                    "Registered backends: $registered (or :auto)."
+            )
+        )
+    end
 end

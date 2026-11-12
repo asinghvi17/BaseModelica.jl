@@ -19,6 +19,31 @@ Pkg.add("BaseModelica")
 parse_basemodelica
 parse_experiment_annotation
 create_odeproblem
+experiment_settings
+BaseModelica.UnsupportedFeatureError
+```
+
+## Discrete backends
+
+How discrete variables and `when` equations are lowered is pluggable. BaseModelica
+evaluates them into a symbolic [`BaseModelica.DiscreteModel`](@ref) and passes it to a
+backend. The built-in backend, `:mtk`, uses ModelingToolkit symbolic events. Other packages
+provide backends by subtyping [`BaseModelica.AbstractDiscreteBackend`](@ref) and calling
+[`BaseModelica.register_discrete_backend!`](@ref) from `__init__`. For example,
+SynchToolkit.jl registers `:synchtoolkit` from its `SynchToolkitBaseModelicaExt` extension,
+so `discrete_backend = :synchtoolkit` works after `using SynchToolkit`.
+
+```@docs
+BaseModelica.AbstractDiscreteBackend
+BaseModelica.register_discrete_backend!
+BaseModelica.unregister_discrete_backend!
+BaseModelica.lower_discrete
+BaseModelica.declare_discrete
+BaseModelica.compile_system
+BaseModelica.DiscreteModel
+BaseModelica.WhenBlock
+BaseModelica.LoweredDiscrete
+BaseModelica.MTKEventsBackend
 ```
 
 ## Contributing

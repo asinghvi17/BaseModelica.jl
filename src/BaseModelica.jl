@@ -39,13 +39,17 @@ Parse a BaseModelica source file into a ModelingToolkit system.
 ## Keyword Arguments
 - `parser::Symbol = :antlr`: Parsing backend. `:antlr` uses the bundled ANTLR grammar;
   `:julia` uses the ParserCombinator implementation.
-- `discrete_backend = :auto`: How discrete variables and `when` equations are lowered.
-  `:mtk` uses ModelingToolkit symbolic events (`@discretes` updated by callback affects).
-  `:synchtoolkit` (experimental) uses clocked variables compiled by SynchToolkit.jl and
-  requires `using SynchToolkit`. `:auto` currently selects `:mtk`.
-- `simplify = true`: `true` returns the system compiled with `mtkcompile` (plus the
-  SynchToolkit pass when that backend is used). `false` returns the unsimplified system, for
-  example to pass to `DyadInterface.simplify_model`. A function `f` returns `f(system)`.
+- `discrete_backend = :auto`: How discrete variables and `when` equations are lowered: the
+  name of a registered backend, or an [`AbstractDiscreteBackend`](@ref) instance. `:mtk`
+  (built in) uses ModelingToolkit symbolic events (`@discretes` updated by callback
+  affects). Other packages register further backends with
+  [`register_discrete_backend!`](@ref); for example `:synchtoolkit` (clocked variables
+  compiled by SynchToolkit.jl) is available after `using SynchToolkit`. `:auto` selects the
+  registered backend that opted in to automatic selection, and `:mtk` if none did.
+- `simplify = true`: `true` returns the system compiled by the backend's
+  [`compile_system`](@ref) (`mtkcompile`, plus any compiler passes the backend needs).
+  `false` returns the unsimplified system, for example to pass to
+  `DyadInterface.simplify_model`. A function `f` returns `f(system)`.
 
 ## Returns
 - A `ModelingToolkitBase.System` representing the equations, variables, parameters,
@@ -54,6 +58,7 @@ Parse a BaseModelica source file into a ModelingToolkit system.
 ## Errors
 - Throws an error when `parser` is neither `:antlr` nor `:julia`, or when the selected parser
   cannot parse `filename`.
+- Throws an `ArgumentError` when no backend is registered under `discrete_backend`.
 
 ## Examples
 
@@ -300,5 +305,16 @@ include("precompilation.jl")
 
 export parse_basemodelica, create_odeproblem, parse_experiment_annotation,
     experiment_settings
+
+# The discrete backend interface is public but not exported (`public` needs Julia 1.11).
+@static if VERSION >= v"1.11"
+    eval(
+        Meta.parse(
+            "public AbstractDiscreteBackend, MTKEventsBackend, DiscreteModel, WhenBlock, " *
+                "LoweredDiscrete, lower_discrete, declare_discrete, compile_system, " *
+                "register_discrete_backend!, unregister_discrete_backend!, UnsupportedFeatureError"
+        )
+    )
+end
 
 end

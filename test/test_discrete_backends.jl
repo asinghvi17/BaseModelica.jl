@@ -1,0 +1,213 @@
+using Test
+using BaseModelica
+using ModelingToolkit
+using ModelingToolkit: Pre
+using OrdinaryDiffEq
+import Symbolics
+
+BM = BaseModelica
+
+testfile(name) = joinpath(dirname(dirname(pathof(BM))), "test", "testfiles", name * ".bmo")
+
+function write_model(body)
+    path = tempname() * ".bmo"
+    write(
+        path, """//! base 0.1.0
+        package 'M'
+          model 'M'
+        $body
+          end 'M';
+        end 'M';
+        """
+    )
+    return path
+end
+
+# Records the DiscreteModel BaseModelica hands over and lowers it with the MTK backend.
+struct RecordingBackend <: BM.AbstractDiscreteBackend
+    seen::Vector{BM.DiscreteModel}
+end
+RecordingBackend() = RecordingBackend(BM.DiscreteModel[])
+function BM.lower_discrete(backend::RecordingBackend, model::BM.DiscreteModel)
+    push!(backend.seen, model)
+    return BM.lower_discrete(BM.MTKEventsBackend(), model)
+end
+
+# Overrides the optional hooks too.
+struct HookBackend <: BM.AbstractDiscreteBackend
+    declared::Vector{Symbol}
+    compiled::Base.RefValue{Int}
+end
+HookBackend() = HookBackend(Symbol[], Ref(0))
+function BM.declare_discrete(backend::HookBackend, name::Symbol)
+    push!(backend.declared, name)
+    return BM.declare_discrete(BM.MTKEventsBackend(), name)
+end
+BM.lower_discrete(::HookBackend, model::BM.DiscreteModel) =
+    BM.lower_discrete(BM.MTKEventsBackend(), model)
+function BM.compile_system(backend::HookBackend, sys)
+    backend.compiled[] += 1
+    return mtkcompile(sys)
+end
+
+# Implements nothing
+struct IncompleteBackend <: BM.AbstractDiscreteBackend end
+
+names_of(xs) = [ModelingToolkit.getname(x) for x in xs]
+error_message(f) = try
+    f()
+    ""
+catch e
+    sprint(showerror, e)
+end
+
+@testset "Discrete backend interface" begin
+    @testset "Registered backend receives the DiscreteModel" begin
+        backend = RecordingBackend()
+        BM.register_discrete_backend!(:recording, backend)
+        try
+            prob = create_odeproblem(testfile("BouncingBallCounter"); discrete_backend = :recording)
+            model = only(backend.seen)
+            @test length(model.equations) == 2
+            @test names_of(model.variables) == [:h, :v]
+            @test names_of(model.states) == [:h, :v]
+            bounces, start = only(model.discretes)
+            @test ModelingToolkit.getname(bounces) == :bounces
+            @test start == 0
+            @test ModelingToolkit.isparameter(bounces)   # default declare_discrete: @discretes
+
+            block = only(model.when_blocks)
+            @test isnothing(block.sample)
+            h, v = model.variables
+            @test isequal(block.condition, h < 0.0)
+            # crosses zero upwards when h < 0 becomes true
+            @test Symbolics.value(Symbolics.substitute(block.crossing, Dict(h => -0.5))) > 0
+            @test Symbolics.value(Symbolics.substitute(block.crossing, Dict(h => 0.5))) < 0
+            # pre(bounces) + 1, with pre as ModelingToolkit.Pre
+            assigned, rhs = only(block.assignments)
+            @test isequal(assigned, bounces)
+            @test isequal(rhs, Pre(bounces) + 1)
+            target, reinit_rhs = only(block.reinits)
+            @test isequal(target, v)
+            @test occursin("Pre(v(t))", string(reinit_rhs))
+
+            # Same solution as the built-in backend
+            sol = solve(prob, Tsit5())
+            ref_prob = create_odeproblem(testfile("BouncingBallCounter"); discrete_backend = :mtk)
+            ref = solve(ref_prob, Tsit5())
+            @test sol.retcode == ReturnCode.Success
+            @test sol(2.5; idxs = prob.f.sys.h) ≈ ref(2.5; idxs = ref_prob.f.sys.h)
+            @test last(sol.ps[prob.f.sys.bounces]) == last(ref.ps[ref_prob.f.sys.bounces]) == 6
+        finally
+            BM.unregister_discrete_backend!(:recording)
+        end
+    end
+
+    @testset "Sample triggers, elsewhen and shared triggers" begin
+        backend = RecordingBackend()
+
+        parse_basemodelica(testfile("SampledCounter"); discrete_backend = backend)
+        model = only(backend.seen)
+        block = only(model.when_blocks)
+        @test block.sample == (0.0, 0.25)
+        @test isnothing(block.condition) && isnothing(block.crossing)
+        @test names_of(first.(block.assignments)) == [:n, :xs]
+        @test isequal(last(block.assignments[2]), only(model.variables))   # xs = x
+
+        parse_basemodelica(testfile("WhenElsewhen"); discrete_backend = backend)
+        @test length(backend.seen[end].when_blocks) == 2
+
+        # Two when-equations with the same condition fire together: one block
+        shared = write_model(
+            """
+                Real 'x'(fixed = true, start = 0.0);
+                discrete Real 'a';
+                discrete Real 'b'(start = 3.0);
+              equation
+                der('x') = 1.0;
+                when 'x' > 0.5 then
+                  'a' = 1.0;
+                end when;
+                when 'x' > 0.5 then
+                  'b' = pre('b') + 1.0;
+                end when;
+            """
+        )
+        sys = parse_basemodelica(shared; discrete_backend = backend)
+        model = backend.seen[end]
+        @test names_of(first.(only(model.when_blocks).assignments)) == [:a, :b]
+        @test Dict(ModelingToolkit.getname(v) => s for (v, s) in model.discretes) == Dict(:a => 0.0, :b => 3.0)
+        sol = solve(ODEProblem(sys, [], (0.0, 1.0)), Tsit5())
+        @test last(sol.ps[sys.a]) == 1.0
+        @test last(sol.ps[sys.b]) == 4.0
+    end
+
+    @testset "Backend instance and optional hooks" begin
+        backend = HookBackend()
+        sys = parse_basemodelica(testfile("DiscreteCounter"); discrete_backend = backend)
+        @test backend.declared == [:n]
+        @test backend.compiled[] == 1
+        @test ModelingToolkit.iscomplete(sys)
+        raw = parse_basemodelica(testfile("DiscreteCounter"); discrete_backend = backend, simplify = false)
+        @test backend.compiled[] == 1
+        @test !ModelingToolkit.iscomplete(raw)
+    end
+
+    @testset ":auto selection" begin
+        @test BM.select_backend(:auto) isa BM.MTKEventsBackend
+        @test BM.select_backend(:mtk) isa BM.MTKEventsBackend
+        first_backend = RecordingBackend()
+        BM.register_discrete_backend!(:first, first_backend; auto = true)
+        try
+            @test BM.select_backend(:auto) === first_backend
+            parse_basemodelica(testfile("DiscreteCounter"))   # default discrete_backend = :auto
+            @test length(first_backend.seen) == 1
+
+            BM.register_discrete_backend!(:second, RecordingBackend(); auto = true)
+            @test occursin("ambiguous", error_message(() -> BM.select_backend(:auto)))
+            @test_throws ArgumentError BM.select_backend(:auto)
+            # Registering again without `auto` withdraws from automatic selection
+            BM.register_discrete_backend!(:second, RecordingBackend())
+            @test BM.select_backend(:auto) === first_backend
+        finally
+            BM.unregister_discrete_backend!(:first)
+            BM.unregister_discrete_backend!(:second)
+        end
+        @test BM.select_backend(:auto) isa BM.MTKEventsBackend
+    end
+
+    @testset "Errors" begin
+        # SynchToolkit is not a test dependency, so its backend is never registered here
+        msg = error_message(() -> parse_basemodelica(testfile("DiscreteCounter"); discrete_backend = :synchtoolkit))
+        @test occursin("No discrete backend is registered as discrete_backend = :synchtoolkit", msg)
+        @test occursin("load SynchToolkit to enable it", msg)
+        @test_throws ArgumentError parse_basemodelica(testfile("DiscreteCounter"); discrete_backend = :synchtoolkit)
+
+        msg = error_message(() -> BM.select_backend(:bogus))
+        @test occursin("load the package that provides it", msg)
+        @test occursin("Registered backends: :mtk", msg)
+        @test_throws ArgumentError BM.select_backend("mtk")
+
+        @test_throws ArgumentError BM.register_discrete_backend!(:mtk, RecordingBackend())
+        @test_throws ArgumentError BM.register_discrete_backend!(:auto, RecordingBackend())
+        @test_throws ArgumentError BM.unregister_discrete_backend!(:mtk)
+
+        # A backend must implement lower_discrete
+        @test_throws MethodError parse_basemodelica(testfile("DiscreteCounter"); discrete_backend = IncompleteBackend())
+    end
+
+    @testset "MTK backend: sample with a phase is unsupported" begin
+        phased = write_model(
+            """
+                Real 'x'(fixed = true, start = 0.0);
+                discrete Real 'n';
+              equation
+                der('x') = 1.0;
+                when sample(0.1, 0.25) then
+                  'n' = pre('n') + 1.0;
+                end when;
+            """
+        )
+        @test_throws BM.UnsupportedFeatureError parse_basemodelica(phased; discrete_backend = :mtk)
+    end
+end

@@ -25,9 +25,10 @@ Base Modelica is as of yet only a proposal with no concrete specification, so th
   periodic `SymbolicDiscreteCallback`. In the body, `v = expr` updates a discrete variable
   and `reinit(x, expr)` resets a continuous state. `pre(v)` and continuous variables read
   their pre-event values.
-  With `using SynchToolkit` and `discrete_backend = :synchtoolkit` (experimental), discrete
-  variables are instead clocked variables on an `EventClock`/`Clock`, compiled by
-  SynchToolkit.jl.
+  The lowering is pluggable: other packages register backends with
+  `BaseModelica.register_discrete_backend!`. With `using SynchToolkit` (SynchToolkit.jl
+  ships the extension), `discrete_backend = :synchtoolkit` (experimental) makes discrete
+  variables clocked variables on an `EventClock`/`Clock`, compiled by SynchToolkit.
 - User-defined functions with an `algorithm` section (`:=`, `if` and `for` statements over
   constant ranges). They are inlined symbolically into the equations.
 - `{...}` array constructors as arguments of functions such as `sum`.

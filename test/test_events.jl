@@ -167,6 +167,6 @@ end
         @test isnothing(experiment_settings(parse_basemodelica(testfile("NewtonCoolingBase"))))
 
         @test_throws ArgumentError create_odeproblem(testfile("BouncingBall"); simplify = false)
-        @test_throws ErrorException parse_basemodelica(testfile("BouncingBall"); discrete_backend = :bogus)
+        @test_throws ArgumentError parse_basemodelica(testfile("BouncingBall"); discrete_backend = :bogus)
     end
 end
