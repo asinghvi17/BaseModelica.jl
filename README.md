@@ -32,6 +32,11 @@ Base Modelica is as of yet only a proposal with no concrete specification, so th
 - User-defined functions with an `algorithm` section (`:=`, `if` and `for` statements over
   constant ranges). They are inlined symbolically into the equations.
 - `{...}` array constructors as arguments of functions such as `sum`.
+- Constants are inlined; parameters whose binding refers to other parameters become
+  ModelingToolkit bindings, recomputed by `remake`; `annotation(Evaluate = true)` parameters
+  are not tunable. Loading warns about `Evaluate = true` parameters and about parameters
+  nothing references, since changing them does not change the model. See the
+  "Constants and parameters" section of the documentation.
 
 Not supported: array variables, records, matrix constructors `[...]`, algorithm sections
 in models, `while` loops, multiple-output function calls, external functions, compound
