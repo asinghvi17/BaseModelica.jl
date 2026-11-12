@@ -499,11 +499,9 @@ spc = Drop(Star(Space() | p"//[^\r\n]*" | p"/[*]([^*]|[*]+[^*/])*[*]+/"))
         BaseModelicaArraySubscripts
     annotation_comment = E"annotation" + class_modification |>
         (args -> BaseModelicaAnnotation(wrap_annotation_content(args)))
-    comment.matcher = (string_comment + annotation_comment[0:1]) |>
-        (
-        x -> length(x) == 1 ? x[1] :
-            BaseModelicaString(join([string(elem) for elem in x], " "))
-    )
+    # A comment is its annotation if it has one (`annotation(Evaluate = true)` on a component
+    # changes how it is translated), and its string comment otherwise.
+    comment.matcher = (string_comment + annotation_comment[0:1]) |> (x -> x[end])
 
     enumeration_literal = IDENT + comment
     enum_list = enumeration_literal + Star(E"," + spc + enumeration_literal)

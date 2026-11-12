@@ -504,9 +504,11 @@ end
 function visit_componentDeclaration(visitor::ASTBuilderVisitor, ctx::Py)
     # componentDeclaration: declaration comment
     decl = visit_declaration(visitor, ctx.declaration())
-    comment_text = visit_comment(visitor, ctx.comment())
+    # Keep a component's annotation: `annotation(Evaluate = true)` changes how the
+    # component is translated.
+    comment = visit_comment(visitor, ctx.comment(); keep_annotation = true)
 
-    return BaseModelicaComponentDeclaration(decl, comment_text)
+    return BaseModelicaComponentDeclaration(decl, comment)
 end
 
 function visit_declaration(visitor::ASTBuilderVisitor, ctx::Py)
@@ -1306,17 +1308,14 @@ function visit_outputExpressionList(visitor::ASTBuilderVisitor, ctx::Py)
 end
 
 # Comment visitors
-function visit_comment(visitor::ASTBuilderVisitor, ctx::Py)
+# Returns the string comment, or the annotation when there is one and `keep_annotation`.
+function visit_comment(visitor::ASTBuilderVisitor, ctx::Py; keep_annotation = false)
     # comment: stringComment annotationComment?
     string_comment = visit_stringComment(visitor, ctx.stringComment())
 
-    # Check if there's an annotationComment
     annotation_ctx = ctx.annotationComment()
-    if !is_null(annotation_ctx)
-        # Parse and store the annotation
-        annotation = visit_annotationComment(visitor, annotation_ctx)
-        # For now, just return the string comment
-        # The annotation is parsed but not yet integrated into the return value
+    if keep_annotation && !is_null(annotation_ctx)
+        return visit_annotationComment(visitor, annotation_ctx)
     end
 
     return string_comment
