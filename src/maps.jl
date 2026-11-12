@@ -119,9 +119,17 @@ initial_value_map = Dict()
 # names of variables that only appear in when-equation bodies (declared as discrete parameters)
 discrete_variable_names = Set{Symbol}()
 
-# names of Boolean variables defined by a relation (e.g. `off = s < 0`), lowered to
-# discrete parameters updated by a zero-crossing callback
+# names of Boolean variables defined by an equation (e.g. `off = s < 0`), lowered to
+# 0/1 discrete parameters, see relation_booleans.jl
 bool_comparison_names = Set{Symbol}()
+
+# name => the Real discrete parameter (0 or 1) that holds the value of a Boolean in
+# `bool_comparison_names`
+relation_boolean_syms = Dict{Symbol, Any}()
+
+# name => start value (0.0 or 1.0) of a Boolean in `bool_comparison_names`, the value of
+# `pre(b)` at initialization
+relation_boolean_starts = Dict{Symbol, Float64}()
 
 # names of parameters declared with fixed = false (to be solved during initialization)
 free_parameter_names = Set{Symbol}()

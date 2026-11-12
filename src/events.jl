@@ -69,6 +69,8 @@ end
 function apply_pre(arg)
     mode = EVAL_MODE[]
     mode === :condition && return arg
+    name = relation_boolean_name(arg)
+    isnothing(name) || return relation_boolean_pre(name)
     mode === :normal && is_discrete_variable(arg) && return arg
     return ModelingToolkit.Pre(arg)
 end
@@ -208,6 +210,26 @@ function to_zero_crossing(cond)
     end
 end
 
+
+# The reinitialization after the continuous events created by BaseModelica. ModelingToolkit
+# compiles the continuous callbacks that share it (and the root finding) into one vector
+# callback, which fires all callbacks whose roots coincide.
+const EVENT_REINITIALIZATION = BrownFullBasicInit()
+
+"""
+    continuous_conditions(crossings, has_states::Bool)
+
+The condition equations `c ~ 0` of a continuous callback with zero-crossings `crossings`.
+ModelingToolkit evaluates a callback with a single condition into a buffer the size of the
+state vector, which throws a `BoundsError` when the system has no states. For such a system
+a condition that never crosses zero is added, which makes it a vector callback with a
+buffer of its own.
+"""
+function continuous_conditions(crossings, has_states::Bool)
+    eqs = Equation[c ~ 0 for c in crossings]
+    has_states || length(eqs) != 1 || push!(eqs, Num(1.0) ~ 0)
+    return eqs
+end
 
 # Variables appearing under a time derivative in `eqs`: the continuous states.
 function differentiated_variables(eqs)
@@ -385,10 +407,13 @@ function lower_discrete(::MTKEventsBackend, model::DiscreteModel)
         affects, discretes = mtk_affect(block, model)
         if isnothing(block.sample)
             # `affect_neg = nothing`: fire only when the condition becomes true (rising edge).
+            # The reinitialization is that of the Boolean callbacks, so that a root shared
+            # with them fires both (see relation_booleans.jl).
             push!(
                 lowered.continuous_events, ModelingToolkitBase.SymbolicContinuousCallback(
-                    Equation[block.crossing ~ 0], affects;
-                    affect_neg = nothing, discrete_parameters = discretes
+                    continuous_conditions([block.crossing], !isempty(model.states)), affects;
+                    affect_neg = nothing, discrete_parameters = discretes,
+                    reinitializealg = EVENT_REINITIALIZATION
                 )
             )
         else
@@ -436,17 +461,21 @@ function mtk_affect(block::WhenBlock, model::DiscreteModel)
 end
 
 """
-    when_blocks(clauses)
+    when_blocks(clauses; boolean_definitions)
 
 Evaluate the AST-level `WhenClause`s into [`WhenBlock`](@ref)s, merging clauses that share
 a trigger: separate callbacks with identical roots do not all fire at the same instant.
+`boolean_definitions` are the definitions of the Booleans defined by an equation (see
+[`lower_relation_booleans`](@ref)).
 """
-function when_blocks(clauses)
+function when_blocks(clauses; boolean_definitions = Dict{Symbol, Any}())
     blocks = WhenBlock[]
     for clause in clauses
         condition = crossing = nothing
         if isnothing(clause.sample)
             condition = with_eval_mode(() -> eval_AST(clause.condition), :condition)
+            # `when b` for a Boolean defined by a relation triggers on that relation
+            condition = expand_relation_boolean(condition, boolean_definitions)
             crossing = to_zero_crossing(condition)
         end
         assignments, reinits = with_eval_mode(:event) do

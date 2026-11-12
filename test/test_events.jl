@@ -117,6 +117,39 @@ end
         @test last(sol.ps[sys.e]) == 6.0
     end
 
+    @testset "Booleans defined by relations ($parser)" for parser in (:julia, :antlr)
+        # Every Boolean has a start value that contradicts its definition at t = 0, which
+        # used to be kept: the solve succeeded with the wrong branch selected throughout.
+        prob = create_odeproblem(testfile("RelationBoolean"); parser)
+        sys = prob.f.sys
+        sol = solve(prob, Rodas5P())
+        @test sol.retcode == ReturnCode.Success
+        at(time, var) = sol(time; idxs = var)
+        # Consistent at initialization: x(0) = 1 so `off` is false and y = 2
+        @test at(0.0, sys.y) == 2.0
+        @test sol[sys.y][1] == 2.0
+        # ... also when the relation depends on an unknown that depends on the Boolean
+        # (ideal diode: s(0) = -0.5 so it blocks, i = 0.1 s)
+        @test at(0.0, sys.i) ≈ -0.05
+        # ... and with pre(): the hysteresis starts on since x(0) < 1.5
+        @test at(0.0, sys.heating) == 1.0
+        # Crossings switch the Booleans, including relations of time alone
+        @test at(0.6, sys.i) ≈ 1.0                                  # diode conducts at t = 0.5
+        @test at(1.1, sys.late) == 0.0
+        @test at(1.3, sys.late) == 1.0                              # time >= 1.2
+        @test at(1.3, sys.lateCopy) == 1.0                          # `late = lateCopy`
+        @test at(1.4, sys.heating) == 1.0
+        @test at(1.6, sys.heating) == 0.0                           # x crosses 2.5
+        # Event iteration after a jump: reinit(x, -1) at t = 2 crosses no zero
+        @test at(1.9, sys.y) == 2.0
+        @test at(2.1, sys.y) == 1.0
+        @test at(2.1, sys.heating) == 1.0
+        @test at(2.1, sys.i) ≈ 0.1 * ((-1.0 + 0.1) - 1.5)          # x(2.1) = -0.9
+        # Changing the initial state re-solves the Booleans
+        sol2 = solve(remake(prob; u0 = [sys.x => -1.0]), Rodas5P())
+        @test sol2(0.0; idxs = sys.y) == 1.0
+    end
+
     @testset "Unsupported constructs throw" begin
         reinit_outside = write_model(
             """
