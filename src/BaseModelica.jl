@@ -75,8 +75,10 @@ function parse_basemodelica(
         filename::AbstractString; parser::Symbol = :antlr, discrete_backend = :auto,
         simplify = true
     )
-    package = parse_package(filename, parser)
-    return baseModelica_to_ModelingToolkit(package; discrete_backend, simplify)
+    return @lock CONVERSION_LOCK begin
+        package = parse_package(filename, parser)
+        baseModelica_to_ModelingToolkit(package; discrete_backend, simplify)
+    end
 end
 
 function parse_package(filename::AbstractString, parser::Symbol)

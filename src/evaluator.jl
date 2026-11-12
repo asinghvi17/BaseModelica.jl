@@ -332,6 +332,11 @@ function eval_AST(
     # Pass 1: Create all symbols in variable_map (without evaluating parameter values)
     # Pass 2: Evaluate parameter values (now all symbols exist for cross-references)
 
+    # Component names in declaration order. Everything handed to ModelingToolkit iterates
+    # these rather than `variable_map`: the iteration order of a Dict keyed by Symbols
+    # depends on what was parsed before in the session.
+    declared_names = unique!([Symbol(comp.component_list[1].declaration.ident[1].name) for comp in components])
+
     vars = Num[]
     declaration_eqs = []
     # Collects stateSelect values keyed by variable name, populated in Pass 2.
@@ -511,7 +516,8 @@ function eval_AST(
     # Pass 3.5: Apply parameter values via setdefault: a number becomes an initial value,
     # an expression a binding. Symbols in the expressions may predate setdefault/setguess,
     # which is fine because metadata does not affect symbol equality.
-    for name in collect(keys(variable_map))
+    for name in declared_names
+        haskey(variable_map, name) || continue
         sym = variable_map[name]
         val = get(parameter_val_map, sym, nothing)
         if !isnothing(val)
@@ -522,9 +528,10 @@ function eval_AST(
     # Build state_priorities from stateSelect attributes collected in Pass 2.
     # variable_map is now fully resolved (after Pass 3.5), so symbol keys are stable.
     state_priorities = Dict(
-        variable_map[name] => val
-            for (name, val) in state_select_raw
-            if haskey(variable_map, name) && val != Int(StateSelectDefault)
+        variable_map[name] => state_select_raw[name]
+            for name in declared_names
+            if haskey(state_select_raw, name) && haskey(variable_map, name) &&
+            state_select_raw[name] != Int(StateSelectDefault)
     )
 
     # Split equations into when-equations (→ events) and regular equations.
@@ -687,8 +694,9 @@ function eval_AST(
     # captures them all — including discrete variables that only appear in callbacks
     # and would be missed by auto-detection from equations.
     all_pars = Num[
-        sym for (_, sym) in variable_map
-            if !is_inlined(sym) && ModelingToolkitBase.isparameter(sym)
+        variable_map[name] for name in declared_names
+            if haskey(variable_map, name) && !is_inlined(variable_map[name]) &&
+            ModelingToolkitBase.isparameter(variable_map[name])
     ]
 
     # Build bindings for free parameters (fixed=false): p => missing signals MTK to
@@ -864,5 +872,10 @@ Convert a parsed `BaseModelicaPackage` into a ModelingToolkit `System`. See
 function baseModelica_to_ModelingToolkit(
         package::BaseModelicaPackage; discrete_backend = :auto, simplify = true
     )
-    return eval_AST(package; backend = select_backend(discrete_backend), simplify)
+    backend = select_backend(discrete_backend)
+    return @lock CONVERSION_LOCK eval_AST(package; backend, simplify)
 end
+
+# The conversion keeps its state in module-level globals (`variable_map`, ...), so
+# conversions running on several threads at once would overwrite each other's state.
+const CONVERSION_LOCK = ReentrantLock()

@@ -96,4 +96,62 @@ parameter_names(sys) = Set(ModelingToolkit.getname.(ModelingToolkit.parameters(s
         # A bound parameter is computed from its binding and cannot be set itself
         @test_throws Exception remake(prob; p = [sys.r => 7.0])
     end
+
+    @testset "Bindings that refer to other parameters ($parser)" for parser in (:julia, :antlr)
+        sys = parse_basemodelica(testfile("ParameterBindings"); parser, simplify = false)
+        # Parameters reach ModelingToolkit in declaration order, whatever was parsed before
+        declared = [
+            Symbol(m.captures[1]) for m in eachmatch(
+                r"parameter Real '([^']+)'", read(testfile("ParameterBindings"), String)
+            )
+        ]
+        @test ModelingToolkit.getname.(ModelingToolkit.parameters(sys)) == declared
+        prob = create_odeproblem(testfile("ParameterBindings"); parser)
+        csys = prob.f.sys
+        @test prob.ps[csys.C] ≈ 1 / (2pi * 1.0 * 1000.0)            # C = 1/(2 pi fG R2)
+        @test prob.ps[csys.var"c.C"] == prob.ps[csys.C]
+        @test prob.ps[csys.var"vIn.startTime"] ≈ -(0.02 + 0.015)      # refers to later parameters
+        @test prob.ps[csys.var"vIn.signalSource.startTime"] == prob.ps[csys.var"vIn.startTime"]
+        sol = solve(prob, Rodas5P())
+        @test sol.retcode == ReturnCode.Success
+        @test sol.ps[csys.var"free.p"] == 2000.0                     # fixed = false, 2 * r2.R
+        prob2 = remake(prob; p = [csys.R1 => 2000.0])
+        @test prob2.ps[csys.var"r2.R"] == 2000.0
+        @test prob2.ps[csys.C] ≈ 1 / (2pi * 1.0 * 2000.0)
+    end
+
+    @testset "Conversions on several threads" begin
+        # The conversion state is global: concurrent conversions used to overwrite each
+        # other's variables, so bindings lost the parameters they refer to.
+        code = """
+        using BaseModelica, ModelingToolkit
+        files = joinpath.($(repr(joinpath(dirname(dirname(pathof(BM))), "test", "testfiles"))),
+            ["ParameterBindings.bmo", "DependentBindings.bmo", "CauerLowPassAnalog.bmo"])
+        convert(f) = parse_basemodelica(f; parser = :julia, simplify = false)
+        canonical(sys) = sort([string(k, " => ", v) for (k, v) in ModelingToolkit.bindings(sys)])
+        reference = Dict(f => canonical(convert(f)) for f in files)
+        jobs = repeat(files, 8)
+        results = Vector{Any}(undef, length(jobs))
+        Threads.@threads for i in eachindex(jobs)
+            results[i] = try
+                canonical(convert(jobs[i])) == reference[jobs[i]]
+            catch e
+                sprint(showerror, e)
+            end
+        end
+        # The ANTLR parser calls Python, which only works on the main thread
+        antlr = fetch(Threads.@spawn try
+            Threads.threadid() == 1 || parse_basemodelica(files[1]; simplify = false)
+            "main thread"
+        catch e
+            sprint(showerror, e)
+        end)
+        println("THREADS ", Threads.nthreads(), " ", count(==(true), results), "/", length(jobs))
+        println("ANTLR ", antlr)
+        """
+        julia = `$(Base.julia_cmd()) --startup-file=no -t 4 --project=$(Base.active_project())`
+        output = read(pipeline(`$julia -e $code`; stderr = devnull), String)
+        @test occursin("THREADS 4 24/24", output)
+        @test occursin(r"ANTLR (main thread|.*must run on the main thread)", output)
+    end
 end

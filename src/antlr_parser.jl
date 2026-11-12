@@ -137,6 +137,14 @@ parse_tree = parse_with_antlr(source)  # Automatically initializes parser on fir
 ```
 """
 function parse_with_antlr(input::String)
+    # Python holds its interpreter lock on the main thread; calling it from another thread
+    # crashes the process.
+    Threads.threadid() == 1 || throw(
+        ArgumentError(
+            "the ANTLR parser calls Python and must run on the main thread (thread 1); " *
+                "use `parser = :julia` to parse BaseModelica files on other threads"
+        )
+    )
     # Lazy initialization - automatically initialize on first use
     if !ANTLR_INITIALIZED[]
         init_antlr_parser()
