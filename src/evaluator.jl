@@ -62,6 +62,7 @@ function build_nested_ifelse(if_expr::BaseModelicaIfExpression, idx = 1)
         return eval_AST(if_expr.expressions[end])
     end
     condition = eval_AST(if_expr.conditions[idx])
+    collect_time_events!(condition)
     then_value = eval_AST(if_expr.expressions[idx])
     else_value = build_nested_ifelse(if_expr, idx + 1)
     return ifelse(condition, then_value, else_value)
@@ -151,11 +152,8 @@ function eval_AST(if_eq::BaseModelicaIfEquation)
 
     has_else = length(if_eq.thens) > length(if_eq.ifs)
 
-    # Collect tstops from time-based conditions (e.g. time < 1e-5)
-    for cond in if_eq.ifs
-        threshold = extract_time_threshold(cond)
-        isnothing(threshold) || push!(tstops_collection, threshold)
-    end
+    # Time events of the conditions (e.g. `time < 1e-5`), see collect_time_events!
+    foreach(cond -> collect_time_events!(eval_AST(cond)), if_eq.ifs)
 
     # Helper to extract RHS for a specific variable from a branch's equation list
     function get_rhs_for_var(var_lhs, branch_equations)
@@ -289,18 +287,29 @@ function eval_AST(component::BaseModelicaComponentClause)
     end
 end
 
-function extract_time_threshold(cond_ast)
-    is_time_ref(x) = x isa BaseModelicaComponentReference &&
-        length(x.ref_list) == 1 &&
-        x.ref_list[1].name == "time"
-    if (cond_ast isa BaseModelicaLessThan || cond_ast isa BaseModelicaLEQ) &&
-            is_time_ref(cond_ast.left) && cond_ast.right isa BaseModelicaNumber
-        return Float64(cond_ast.right.val)
-    elseif (cond_ast isa BaseModelicaGEQ || cond_ast isa BaseModelicaGreaterThan) &&
-            is_time_ref(cond_ast.left) && cond_ast.right isa BaseModelicaNumber
-        return Float64(cond_ast.right.val)
+"""
+    collect_time_events!(condition)
+
+Add to `tstops_collection` the instants at which a relation of `condition` between `time`
+and an expression of parameters, such as `time < startTime`, changes. Such an if-condition
+switches at a known time without generating an event, so the solver is made to stop there
+instead of stepping over the discontinuity. The instants stay symbolic and follow changes
+of the parameters.
+"""
+function collect_time_events!(condition)
+    x = Symbolics.unwrap(condition)
+    x isa SymbolicUtils.BasicSymbolic && SymbolicUtils.iscall(x) || return
+    args = SymbolicUtils.arguments(x)
+    if SymbolicUtils.operation(x) in RELATIONS
+        a, b = args
+        instant = isequal(a, t) ? b : isequal(b, t) ? a : nothing
+        if !isnothing(instant) && !varies_continuously(instant)
+            any(isequal(instant), tstops_collection) || push!(tstops_collection, instant)
+        end
+    else
+        foreach(collect_time_events!, args)
     end
-    return nothing
+    return
 end
 
 function eval_AST(
@@ -314,6 +323,8 @@ function eval_AST(
     empty!(evaluated_parameter_names)
     empty!(tstops_collection)
     empty!(bool_comparison_names)
+    empty!(relation_boolean_syms)
+    empty!(relation_boolean_starts)
 
     class_specifier = model.long_class_specifier
 
@@ -378,21 +389,17 @@ function eval_AST(
                 # are represented (MTK discretes or SynchToolkit clocked variables).
                 variable_map[name] = declare_discrete(backend, name)
             elseif comp.type_specifier.type == "Boolean"
-                # Bool comparison vars (e.g. `off = s < 0`) become discrete parameters.
-                # They hold their value between events and are updated by a zero-crossing
-                # callback. ImperativeAffect is used (not discrete_parameters), so dotted
-                # names like `Ideal.off` are fine — Symbolics wraps them in var"..." in
-                # generated code, avoiding any parse issues.
+                # Booleans defined by an equation (e.g. `off = s < 0`) hold their value
+                # between events: a 0/1 discrete parameter, see relation_booleans.jl.
+                # Equations see `off > 0.5`.
                 push!(bool_comparison_names, name)
-                disc_sym = only(@discretes($name(t)::Bool))
-                # Apply start value if declared (sets the initial discrete state)
+                disc_sym = only(@discretes($name(t)::Real))
                 start_val = get_class_modification_value(
                     comp.component_list[1].declaration.modification, "start"
                 )
-                default_val = !isnothing(start_val) ? start_val : false
-                disc_sym = ModelingToolkitBase.setdefault(disc_sym, default_val)
-                variable_map[name] = disc_sym
-                # Don't push to vars — discrete parameters appear in all_pars
+                relation_boolean_starts[name] = start_val === true ? 1.0 : 0.0
+                relation_boolean_syms[name] = disc_sym
+                variable_map[name] = relation_boolean_value(disc_sym)
             else
                 variable_map[name] = only(@variables($name(t)))
                 push!(vars, variable_map[name])
@@ -422,7 +429,9 @@ function eval_AST(
             )
             continue
         elseif name in bool_comparison_names
-            # Bool-comparison vars are handled separately; skip pass-2 processing.
+            # A declaration equation `Boolean b = expr` defines b
+            expr = binding_expression(declaration)
+            isnothing(expr) || push!(declaration_eqs, variable_map[name] ~ eval_AST(expr))
             continue
         elseif !haskey(variable_map, name) || is_inlined(variable_map[name])
             # Skipped String component, or inlined constant
@@ -576,10 +585,14 @@ function eval_AST(
     initialization_eqs = Equation[]
     has_free_params = !isempty(free_parameter_names)
     # `pre(v) = value` / `v = value` for a discrete v sets the start value of v
-    for (var, value) in initial_algorithm_assignments(initial_algorithms, composition.annotation)
+    assignments, initial_assertions =
+        initial_algorithm_assignments(initial_algorithms, composition.annotation)
+    for (var, value) in assignments
         name = symbol_name(var)
         if name in discrete_variable_names && value isa Number
             discrete_starts[name] = value
+        elseif haskey(relation_boolean_syms, name) && value isa Bool
+            relation_boolean_starts[name] = value ? 1.0 : 0.0
         else
             push!(initialization_eqs, var ~ value)
         end
@@ -587,7 +600,13 @@ function eval_AST(
     initial_equations = filter(initial_equations) do eq
         name = discrete_initial_target(eq)
         isnothing(name) && return true
-        discrete_starts[name] = eval_AST(eq.equation.equation.rhs)
+        value = eval_AST(eq.equation.equation.rhs)
+        if haskey(relation_boolean_syms, name)
+            value isa Bool || return true
+            relation_boolean_starts[name] = value ? 1.0 : 0.0
+        else
+            discrete_starts[name] = value
+        end
         return false
     end
     for dictionary in [eval_AST(eq) for eq in initial_equations]
@@ -624,70 +643,9 @@ function eval_AST(
         !isnothing(idx) && (vars[idx] = variable_map[name])
     end
 
-    # Build discrete callbacks for Bool comparison variables (e.g. `off = s < 0`).
-    # `off` is a discrete parameter (constant between events) so the Jacobian is
-    # smooth between events — no Dirac delta at the switching point.
-    # The callback detects s=0 crossings and updates `off`:
-    #   s goes positive→negative: off becomes true  (affect, diode starts blocking)
-    #   s goes negative→positive: off becomes false (affect_neg, diode starts conducting)
-    # The sanitized name (dots → underscores) avoids an MTK codegen bug where
-    # dotted parameter names produce invalid Julia like `Ideal.offₜ₋₁`.
-    bool_crossing_callbacks = ModelingToolkitBase.SymbolicContinuousCallback[]
-    filtered_eqs = Equation[]
-    for eq in eqs
-        lhs_name = try
-            SymbolicIndexingInterface.getname(eq.lhs)
-        catch
-            nothing
-        end
-        if isa(eq, Equation) && lhs_name in bool_comparison_names
-            off_sym = eq.lhs
-            crossing = try
-                to_zero_crossing(eq.rhs)
-            catch
-                nothing
-            end
-            if !isnothing(crossing)
-                # Use ImperativeAffect to bypass ImplicitDiscreteFunction codegen,
-                # which has a bug with discrete parameter names containing subscripts.
-                affect = ModelingToolkitBase.ImperativeAffect(
-                    (m, o, ctx, integ) -> (; off = true);
-                    modified = (; off = off_sym)
-                )
-                affect_neg = ModelingToolkitBase.ImperativeAffect(
-                    (m, o, ctx, integ) -> (; off = false);
-                    modified = (; off = off_sym)
-                )
-                cb = ModelingToolkitBase.SymbolicContinuousCallback(
-                    Equation[crossing ~ 0],
-                    affect;
-                    affect_neg = affect_neg,
-                    reinitializealg = BrownFullBasicInit(),
-                )
-                push!(bool_crossing_callbacks, cb)
-            else
-                # Not a comparison expression — treat as a constant Bool assignment.
-                concrete_val = try
-                    b = Symbolics.value(eq.rhs)
-                    b isa Bool ? b : nothing
-                catch
-                    nothing
-                end
-                if !isnothing(concrete_val)
-                    variable_map[lhs_name] =
-                        ModelingToolkitBase.setdefault(off_sym, concrete_val)
-                end
-                # Either way, don't add to filtered_eqs: `off` is a discrete parameter.
-            end
-            # Omit the definition equation: `off` is updated by the callback, not by
-            # an algebraic equation in the DAE.
-        else
-            push!(filtered_eqs, eq)
-        end
-    end
-    eqs = filtered_eqs
-
-    real_eqs = Equation[declaration_eqs..., eqs...]
+    # Booleans defined by an equation (`off = s < 0`), see relation_booleans.jl
+    booleans = lower_relation_booleans(Equation[declaration_eqs..., eqs...], class_specifier.name)
+    real_eqs = booleans.equations
 
     # Collect all parameters from variable_map after all passes have applied defaults.
     # Both regular @parameters and @discretes symbols have PARAMETER type, so this
@@ -698,16 +656,20 @@ function eval_AST(
             if haskey(variable_map, name) && !is_inlined(variable_map[name]) &&
             ModelingToolkitBase.isparameter(variable_map[name])
     ]
+    append!(all_pars, booleans.parameters)
 
     # Build bindings for free parameters (fixed=false): p => missing signals MTK to
     # solve for p during initialization using initialization_eqs.
-    bindings = [variable_map[name] => missing for name in free_parameter_names]
+    bindings = Pair[
+        variable_map[name] => missing for name in declared_names if name in free_parameter_names
+    ]
+    append!(bindings, booleans.bindings)
 
     # Lower when-equations through the discrete backend.
     discrete_model = DiscreteModel(
         real_eqs, copy(vars), differentiated_variables(real_eqs),
         Pair{Any, Any}[variable_map[name] => discrete_starts[name] for name in sort!(collect(keys(discrete_starts)))],
-        when_blocks(when_clause_list)
+        when_blocks(when_clause_list; boolean_definitions = booleans.definitions)
     )
     lowered = lower_discrete(backend, discrete_model)
     real_eqs = lowered.equations
@@ -720,12 +682,19 @@ function eval_AST(
 
     @named sys = System(
         real_eqs, t, vars, all_pars;
-        continuous_events = vcat(lowered.continuous_events, bool_crossing_callbacks),
-        discrete_events = lowered.discrete_events,
-        initialization_eqs = vcat(initialization_eqs, lowered.initialization_eqs),
+        continuous_events = vcat(lowered.continuous_events, booleans.continuous_events),
+        discrete_events = vcat(
+            lowered.discrete_events, booleans.discrete_events,
+            initial_assertion_events(initial_assertions, class_specifier.name)
+        ),
+        initialization_eqs = vcat(
+            initialization_eqs, lowered.initialization_eqs, booleans.initialization_eqs
+        ),
         initial_conditions = Dict(lowered.initial_conditions),
         bindings = bindings,
         state_priorities = state_priorities,
+        # One vector: ModelingToolkit reads a scalar tstop as a period
+        tstops = isempty(tstops_collection) ? [] : Any[copy(tstops_collection)],
     )
     experiment = parse_experiment_annotation(composition.annotation)
     if !isnothing(experiment)
@@ -743,19 +712,26 @@ end
 """
     initial_algorithm_assignments(sections, annotation)
 
-Run `initial algorithm` sections, which may only contain assignments, and return the final
-`variable => value` pairs. Assignments are sequential, so later statements see earlier
-results, and `time` is the experiment start time (0 without an experiment annotation).
+Run `initial algorithm` sections, which may only contain assignments and `assert` calls.
+Returns the final `variable => value` pairs and the assertions as
+`(condition, message, level)` tuples. Statements are sequential, so later statements see
+earlier results, and `time` is the experiment start time (0 without an experiment
+annotation).
 """
 function initial_algorithm_assignments(sections, annotation)
-    isempty(sections) && return Pair[]
+    assertions = Tuple{Any, String, Symbol}[]
+    isempty(sections) && return Pair[], assertions
     experiment = parse_experiment_annotation(annotation)
     scope = Dict{Symbol, Any}(:time => isnothing(experiment) ? 0.0 : experiment.StartTime)
     assigned = Symbol[]
     with_local_scope(scope) do
         for section in sections, st in section.statements
+            if st isa BaseModelicaFunctionCall && function_call_name(st) == "assert"
+                push!(assertions, evaluate_assert(st))
+                continue
+            end
             st isa BaseModelicaAssignment && length(st.target.ref_list) == 1 ||
-                unsupported("initial algorithm sections may only contain assignments")
+                unsupported("initial algorithm sections may only contain assignments and assert calls")
             name = Symbol(st.target.ref_list[1].name)
             haskey(variable_map, name) ||
                 unsupported("initial algorithm assigns unknown variable `$name`")
@@ -763,11 +739,77 @@ function initial_algorithm_assignments(sections, annotation)
             name in assigned || push!(assigned, name)
         end
     end
-    return Pair[variable_map[name] => scope[name] for name in assigned]
+    return Pair[variable_map[name] => scope[name] for name in assigned], assertions
 end
 
-# The discrete variable named by the left-hand side of an initial equation `pre(v) = ...`
-# or `v = ...`, or nothing if the equation does not initialize a discrete variable.
+# `(condition, message, level)` of `assert(condition, message[, level])`; `level` is
+# `:warning` for `AssertionLevel.warning` and `:error` otherwise.
+function evaluate_assert(call::BaseModelicaFunctionCall)
+    args = call.args.args
+    length(args) in (2, 3) || unsupported("assert expects `assert(condition, message[, level])`")
+    condition = eval_AST(args[1])
+    message = try
+        eval_AST(args[2])
+    catch
+        nothing  # e.g. a message built with String(...)
+    end
+    message isa AbstractString || (message = "(message could not be evaluated)")
+    level = length(args) == 3 && args[3] isa BaseModelicaComponentReference &&
+        args[3].ref_list[end].name == "warning" ? :warning : :error
+    return condition, String(message), level
+end
+
+"""
+    InitialAssertions
+
+The `initialize` affect that checks the `assert` calls of the initial algorithm once the
+model is initialized: a failed assertion of level error throws, one of level warning logs a
+warning. The conditions are observed in order, `messages[i]` and `levels[i]` belong to the
+i-th.
+"""
+struct InitialAssertions
+    model::String
+    messages::Vector{String}
+    levels::Vector{Symbol}
+end
+
+function (check::InitialAssertions)(modified, observed, ctx, integ)
+    for (holds, message, level) in zip(values(observed), check.messages, check.levels)
+        Bool(holds) && continue
+        text = "BaseModelica model '$(check.model)': assertion of the initial algorithm failed at initialization: $message"
+        level === :error ? error(text) : @warn(text)
+    end
+    return (;)
+end
+
+# A discrete callback that never fires, whose `initialize` affect checks `assertions`.
+# Assertions that hold at translation are dropped, ones that fail there throw or warn.
+function initial_assertion_events(assertions, model_name)
+    model_name isa BaseModelicaIdentifier && (model_name = model_name.name)
+    pending = filter(assertions) do (condition, message, level)
+        value = concrete_value(condition)
+        isnothing(value) && return true
+        value == true && return false
+        text = "BaseModelica model '$model_name': assertion of the initial algorithm fails: $message"
+        level === :error ? throw(ArgumentError(text)) : @warn(text)
+        return false
+    end
+    isempty(pending) && return Any[]
+    check = InitialAssertions(String(model_name), [a[2] for a in pending], [a[3] for a in pending])
+    observed = NamedTuple{Tuple(Symbol(:c, i) for i in eachindex(pending))}(
+        Tuple(Num(a[1]) for a in pending)
+    )
+    return Any[
+        ModelingToolkitBase.SymbolicDiscreteCallback(
+            Float64[], nothing;
+            initialize = ModelingToolkitBase.ImperativeAffect(check; observed)
+        ),
+    ]
+end
+
+# The discrete variable or Boolean (see relation_booleans.jl) named by the left-hand side of
+# an initial equation `pre(v) = ...` or `v = ...`, or nothing if the equation does not
+# initialize one.
 function discrete_initial_target(eq::BaseModelicaInitialEquation)
     inner = eq.equation.equation
     inner isa BaseModelicaSimpleEquation || return nothing
@@ -777,7 +819,8 @@ function discrete_initial_target(eq::BaseModelicaInitialEquation)
     end
     lhs isa BaseModelicaComponentReference || return nothing
     name = Symbol(lhs.ref_list[1].name)
-    return name in discrete_variable_names ? name : nothing
+    return name in discrete_variable_names || haskey(relation_boolean_syms, name) ? name :
+        nothing
 end
 
 function eval_AST(package::BaseModelicaPackage; kwargs...)

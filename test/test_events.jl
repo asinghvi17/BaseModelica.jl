@@ -117,6 +117,45 @@ end
         @test last(sol.ps[sys.e]) == 6.0
     end
 
+    @testset "assert in an initial algorithm ($parser)" for parser in (:julia, :antlr)
+        failure(f) =
+            try
+                f()
+                ""
+            catch e
+                sprint(showerror, e)
+            end
+        sys = parse_basemodelica(testfile("InitialAssert"); parser)
+        prob = ODEProblem(sys, [], (0.0, 1.0))
+        # All assertions hold: no warning, and the assignment between them still applies
+        sol = @test_logs solve(prob, Tsit5())
+        @test sol.retcode == ReturnCode.Success
+        @test first(sol.ps[sys.counter]) == 1.0
+        # They are checked at initialization with the current parameters and state
+        @test_logs (:warn, r"width must be smaller than period") solve(
+            remake(prob; p = [sys.period => 0.1]), Tsit5()
+        )
+        @test occursin(
+            "period must be positive",
+            failure(() -> solve(remake(prob; p = [sys.period => -1.0]), Tsit5()))
+        )
+        @test occursin(
+            "x and counter must be positive",
+            failure(() -> solve(remake(prob; u0 = [sys.x => -1.0]), Tsit5()))
+        )
+        # An assertion that fails whatever the parameters is rejected at translation
+        path = write_model(
+            """
+                Real 'x'(fixed = true, start = 0.0);
+              initial algorithm
+                assert(1.0 > 2.0, "never holds");
+              equation
+                der('x') = 1.0;
+            """
+        )
+        @test occursin("never holds", failure(() -> parse_basemodelica(path; parser)))
+    end
+
     @testset "Booleans defined by relations ($parser)" for parser in (:julia, :antlr)
         # Every Boolean has a start value that contradicts its definition at t = 0, which
         # used to be kept: the solve succeeded with the wrong branch selected throughout.
