@@ -29,6 +29,11 @@ Base Modelica is as of yet only a proposal with no concrete specification, so th
   `BaseModelica.register_discrete_backend!`. With `using SynchToolkit` (SynchToolkit.jl
   ships the extension), `discrete_backend = :synchtoolkit` (experimental) makes discrete
   variables clocked variables on an `EventClock`/`Clock`, compiled by SynchToolkit.
+- Boolean variables defined by an equation (`off = s < 0`, hysteresis with `pre`) keep their
+  value between events and are solved consistently at initialization and re-evaluated at
+  events. `if time < startTime` conditions become solver `tstops` on the system, and
+  `assert` in an `initial algorithm` is checked at initialization. See the "Booleans,
+  events and the solver" section of the documentation.
 - User-defined functions with an `algorithm` section (`:=`, `if` and `for` statements over
   constant ranges). They are inlined symbolically into the equations.
 - `{...}` array constructors as arguments of functions such as `sum`.
@@ -85,7 +90,8 @@ To automatically create an ODEProblem ready for simulation, use `create_odeprobl
 ```julia
 using BaseModelica, DifferentialEquations
 
-# Automatically sets tspan, reltol, and saveat from annotation if present
+# Automatically sets tspan, reltol, and saveat (and dtmax for models without states)
+# from the annotation if present
 prob = create_odeproblem("path/to/ExampleFirstOrder.bmo")
 
 # Solve and plot

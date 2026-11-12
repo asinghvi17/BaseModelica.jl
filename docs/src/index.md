@@ -55,6 +55,37 @@ How declarations map to ModelingToolkit, and what `remake` can change afterwards
   `Evaluate = true`. Loading the model warns once, listing them: changing them has no
   effect.
 
+## Booleans, events and the solver
+
+- **Booleans defined by an equation**, such as `off = s < 0` or the hysteresis
+  `y = pre(y) and u < a or u < b`, hold their value between events, as relations do in
+  Modelica. Each is a discrete parameter holding 0 or 1 (equations see `off > 0.5`), so
+  `sol.ps[sys.off]` reads 0.0 or 1.0. It is solved during initialization together with the
+  unknowns it depends on, instead of keeping a `start` value that contradicts its
+  definition, and `remake` with new initial values solves it again. Every relation of a
+  definition that varies continuously gets a zero-crossing event, after which the Booleans
+  are re-evaluated until none changes. They are also re-evaluated after any step at which
+  one disagrees with its definition, which catches relations that jump at another event
+  (`reinit`, `when` assignments).
+- **Time events**: the instants at which an if-condition comparing `time` with a number or
+  an expression of parameters switches (`if time < startTime then ...`) are stored as
+  `tstops` on the system. ModelingToolkit passes them to every problem built from it, so
+  the solver stops there instead of stepping over the discontinuity, and they follow
+  parameter changes.
+- **Models without differential states**: error control does not limit the step size, so
+  a single step can span the whole simulation. `create_odeproblem` sets `dtmax` to the
+  experiment `Interval` (or a 500th of the time span) for such models, so that events
+  between steps are found; when building the problem yourself, pass `dtmax`. Reading
+  `sol(t; idxs = ...)` is exact between steps, while `sol[var]` only holds the saved
+  points (`saveat` is the `Interval`).
+- **`assert` in an `initial algorithm`** is checked once the model is initialized, with the
+  current parameters and initial values: a failed assertion throws from `solve` (level
+  `AssertionLevel.warning`: logs a warning). One that can never hold is rejected when the
+  model is loaded. `assert` in equations is not checked.
+- **Threads**: conversions are serialized by a lock, so `parse_basemodelica` can be called
+  from several tasks. The `:antlr` parser calls Python and only runs on the main thread;
+  use `parser = :julia` elsewhere.
+
 ## Discrete backends
 
 How discrete variables and `when` equations are lowered is pluggable. BaseModelica
