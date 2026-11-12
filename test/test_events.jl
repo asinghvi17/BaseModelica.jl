@@ -150,6 +150,61 @@ end
         @test sol2(0.0; idxs = sys.y) == 1.0
     end
 
+    @testset "Time events reach the solver as tstops ($parser)" for parser in (:julia, :antlr)
+        # if-conditions comparing time with parameters or numbers, without events
+        prob = create_odeproblem(testfile("TimeEvents"); parser)
+        sys = prob.f.sys
+        @test prob.kwargs[:tstops](prob.p, prob.tspan) == [0.3, 0.7, 0.9, 5.0]
+        sol = solve(prob, Tsit5())
+        @test sol.retcode == ReturnCode.Success
+        @test all(ts -> any(≈(ts), sol.t), (0.3, 0.7, 0.9))
+        # x(1) = 1 * (0.7 - 0.3) + 2 * (1 - 0.7) + 1 * (1 - 0.9)
+        @test sol[sys.x][end] ≈ 1.1 rtol = 1.0e-4
+        # The tstops are on the system, so a problem built without create_odeproblem gets
+        # them too, and they follow the parameters
+        prob2 = ODEProblem(parse_basemodelica(testfile("TimeEvents"); parser), [], (0.0, 1.0))
+        prob2 = remake(prob2; p = [prob2.f.sys.startTime => 0.5])
+        @test prob2.kwargs[:tstops](prob2.p, prob2.tspan) == [0.5, 0.9, 5.0]
+        # Explicit tstops replace the model's
+        @test create_odeproblem(testfile("TimeEvents"); parser, tstops = [0.25]).kwargs[:tstops] == [0.25]
+    end
+
+    @testset "Models without differential states ($parser)" for parser in (:julia, :antlr)
+        # A single step could span the whole simulation and miss most of the 50 rising
+        # edges of y > 0.5; create_odeproblem bounds the step by the output interval
+        prob = create_odeproblem(testfile("NoStates"); parser)
+        sys = prob.f.sys
+        @test isempty(unknowns(sys))
+        @test prob.kwargs[:dtmax] == 0.05
+        @test prob.kwargs[:saveat] == 0.05
+        sol = solve(prob, Tsit5())
+        @test sol.retcode == ReturnCode.Success
+        @test sol.ps[sys.n][end] == 50
+        # y peaks at 0.005 + k/50 and has its minimum at 0.015 + k/50
+        @test all(k -> sol(0.005 + k / 50; idxs = sys.high) == 1.0, 0:49)
+        @test all(k -> sol(0.015 + k / 50; idxs = sys.high) == 0.0, 0:49)
+        @test sol(0.123; idxs = sys.y) ≈ sin(2pi * 50 * 0.123) atol = 1.0e-10
+        # An explicit dtmax takes precedence
+        @test create_odeproblem(testfile("NoStates"); parser, dtmax = 0.01).kwargs[:dtmax] == 0.01
+        # A lone continuous event on a system without states (ModelingToolkit used to
+        # evaluate its condition into the empty state buffer: BoundsError)
+        path = write_model(
+            """
+                Real 'y';
+                discrete Real 'n'(start = 0.0);
+              equation
+                'y' = sin(2.0 * 3.141592653589793 * time);
+                when 'y' > 0.5 then
+                  'n' = pre('n') + 1.0;
+                end when;
+            """
+        )
+        prob = create_odeproblem(path; parser)
+        sol = solve(prob, Tsit5())
+        @test sol.retcode == ReturnCode.Success
+        @test sol.ps[prob.f.sys.n][end] == 1.0
+    end
+
     @testset "Unsupported constructs throw" begin
         reinit_outside = write_model(
             """

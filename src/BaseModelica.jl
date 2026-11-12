@@ -24,6 +24,7 @@ include("ast.jl")
 include("julia_parser.jl")
 include("antlr_parser.jl")
 include("events.jl")
+include("relation_booleans.jl")
 include("evaluator.jl")
 include("parameters.jl")
 include("functions.jl")
@@ -225,8 +226,15 @@ experiment_settings(sys) = SymbolicUtils.getmetadata(sys, ExperimentAnnotation, 
 Parse a BaseModelica source file and create an ODE problem with experiment settings.
 
 If the model has an `annotation(experiment(...))` block, its `StartTime` and `StopTime` become
-the problem time span, `Tolerance` becomes `reltol`, and `Interval` becomes `saveat`. Explicit
-keyword arguments override those annotation-derived defaults.
+the problem time span, `Tolerance` becomes `reltol`, and `Interval` becomes `saveat`. A model
+without differential states also gets `dtmax = Interval` (or a 500th of the time span): the
+step size of such a model is not limited by error control, and events between the few
+points of a single long step would be missed. Explicit keyword arguments override those
+defaults.
+
+The time instants at which if-conditions such as `time < startTime` switch are stored as
+`tstops` on the system, so they reach the solver also when the problem is built with
+`SciMLBase.ODEProblem(parse_basemodelica(filename), ...)`.
 
 ## Arguments
 - `filename::AbstractString`: Path to a BaseModelica source file.
@@ -237,8 +245,8 @@ keyword arguments override those annotation-derived defaults.
 - `discrete_backend = :auto`: See [`parse_basemodelica`](@ref).
 - `simplify = true`: How the system is simplified before building the problem: `true` for
   the default `mtkcompile`, or a function such as `DyadInterface.simplify_model`.
-- `kwargs...`: Keyword arguments forwarded to `SciMLBase.ODEProblem`. `reltol` and `saveat`
-  override values read from an experiment annotation.
+- `kwargs...`: Keyword arguments forwarded to `SciMLBase.ODEProblem`. `reltol`, `saveat` and
+  `dtmax` override the defaults described above, `tstops` replaces the model's.
 
 ## Returns
 - A `SciMLBase.ODEProblem` constructed from the imported ModelingToolkit system.
@@ -264,44 +272,30 @@ function create_odeproblem(
     )
     simplify === false &&
         throw(ArgumentError("create_odeproblem needs a simplified system; pass `simplify = true` or a function"))
-    package = parse_package(filename, parser)
+    sys = parse_basemodelica(filename; parser, discrete_backend, simplify)
 
-    # Convert to ModelingToolkit
-    sys = baseModelica_to_ModelingToolkit(package; discrete_backend, simplify)
-
-    # Collect tstops from time-based if-equation conditions (e.g. `if time < 1e-5`)
-    # so the ODE solver stops exactly at each discontinuity.
-    model_tstops = isempty(tstops_collection) ? nothing : sort!(collect(tstops_collection))
-
-    # Experiment settings travel with the system as metadata
-    exp_params = experiment_settings(sys)
-
-    # Create ODEProblem with appropriate time span and tolerance
-    if !isnothing(exp_params)
-        tspan = (exp_params.StartTime, exp_params.StopTime)
-
-        # Build kwargs with annotation defaults, but allow user overrides
-        # Check if reltol or saveat are already in kwargs
-        kwargs_keys = keys(kwargs)
-
-        # Start with annotation values
-        annotation_kwargs = NamedTuple()
-        if !(:reltol in kwargs_keys)
-            annotation_kwargs = merge(annotation_kwargs, (reltol = exp_params.Tolerance,))
-        end
-        if !(:saveat in kwargs_keys) && !isnothing(exp_params.Interval)
-            annotation_kwargs = merge(annotation_kwargs, (saveat = exp_params.Interval,))
-        end
-
-        # Merge annotation defaults with user kwargs (user kwargs take precedence)
-        prob = ODEProblem(sys, u0, tspan; missing_guess_value = ModelingToolkitBase.MissingGuessValue.Constant(0.0), annotation_kwargs..., kwargs...)
-        return prob
-    else
-        # Default time span if no annotation
-        tspan = (0.0, 1.0)
-        prob = ODEProblem(sys, u0, tspan; missing_guess_value = ModelingToolkitBase.MissingGuessValue.Constant(0.0), kwargs...)
-        return prob
+    # Experiment settings travel with the system as metadata; explicit keyword arguments
+    # take precedence over the defaults derived from them
+    experiment = experiment_settings(sys)
+    tspan = isnothing(experiment) ? (0.0, 1.0) : (experiment.StartTime, experiment.StopTime)
+    defaults = Dict{Symbol, Any}()
+    if !isnothing(experiment)
+        defaults[:reltol] = experiment.Tolerance
+        isnothing(experiment.Interval) || (defaults[:saveat] = experiment.Interval)
     end
+    # Without differential states the error estimate is zero, so the step size is unbounded:
+    # one step can span the whole simulation and miss events between its few sample points.
+    # Stop at least once per output interval, as Modelica tools do.
+    if isempty(differentiated_variables(equations(sys)))
+        interval = isnothing(experiment) ? nothing : experiment.Interval
+        defaults[:dtmax] = something(interval, (tspan[2] - tspan[1]) / 500)
+    end
+    defaults = NamedTuple(k => v for (k, v) in defaults if !haskey(kwargs, k))
+    return ODEProblem(
+        sys, u0, tspan;
+        missing_guess_value = ModelingToolkitBase.MissingGuessValue.Constant(0.0),
+        defaults..., kwargs...
+    )
 end
 
 include("precompilation.jl")

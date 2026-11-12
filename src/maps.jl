@@ -140,5 +140,6 @@ evaluated_parameter_names = Symbol[]
 # maps enum type name → (value_name → integer), e.g. "Modelica.Blocks.Types.Init" => Dict(:NoInit => 1, ...)
 enum_map = Dict{String, Dict{Symbol, Int}}()
 
-# threshold times extracted from if-equations with `time < constant` conditions
-tstops_collection = Set{Float64}()
+# instants (numbers or expressions of parameters) at which an if-condition comparing
+# `time` with them switches, see `collect_time_events!`
+tstops_collection = Any[]
