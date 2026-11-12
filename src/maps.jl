@@ -126,6 +126,9 @@ bool_comparison_names = Set{Symbol}()
 # names of parameters declared with fixed = false (to be solved during initialization)
 free_parameter_names = Set{Symbol}()
 
+# names of parameters marked `annotation(Evaluate = true)`, in declaration order
+evaluated_parameter_names = Symbol[]
+
 # maps enum type name → (value_name → integer), e.g. "Modelica.Blocks.Types.Init" => Dict(:NoInit => 1, ...)
 enum_map = Dict{String, Dict{Symbol, Int}}()
 

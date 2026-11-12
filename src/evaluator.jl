@@ -311,6 +311,7 @@ function eval_AST(
     empty!(parameter_val_map)
     empty!(discrete_variable_names)
     empty!(free_parameter_names)
+    empty!(evaluated_parameter_names)
     empty!(tstops_collection)
     empty!(bool_comparison_names)
 
@@ -332,7 +333,6 @@ function eval_AST(
     # Pass 2: Evaluate parameter values (now all symbols exist for cross-references)
 
     vars = Num[]
-    pars = Num[]
     declaration_eqs = []
     # Collects stateSelect values keyed by variable name, populated in Pass 2.
     # Keyed by name (Symbol) rather than the symbol itself so the final state_priorities
@@ -351,13 +351,18 @@ function eval_AST(
         if type_prefix == "parameter" || haskey(enum_map, comp.type_specifier.type)
             comp.type_specifier.type == "String" && continue
             julia_type = modelica_type_to_julia(comp.type_specifier.type)
-            variable_map[name] = only(@parameters($name::julia_type))
-            push!(pars, variable_map[name])
+            variable_map[name] = if type_prefix == "parameter" && is_evaluate_annotated(comp)
+                push!(evaluated_parameter_names, name)
+                only(@parameters $name::julia_type [tunable = false, description = evaluated_description(name)])
+            else
+                only(@parameters($name::julia_type))
+            end
         elseif type_prefix == "constant"
+            # A symbol for now, so that constants can refer to each other; replaced by its
+            # value below.
             comp.type_specifier.type == "String" && continue
             julia_type = modelica_type_to_julia(comp.type_specifier.type)
             variable_map[name] = only(@parameters($name::julia_type))
-            push!(pars, variable_map[name])
         elseif type_prefix == "discrete"
             # Explicitly declared discrete variables — treat same as when-body discretes.
             union!(discrete_variable_names, [name])
@@ -390,6 +395,11 @@ function eval_AST(
         end
     end
 
+    inline_constants!(variable_map, components)
+    warn_structural_parameters(
+        class_specifier.name, evaluated_parameter_names, inert_parameter_names(composition)
+    )
+
     # Start values of discrete variables (the value of `pre(v)` at the first event).
     # Modelica's default start value is zero (false for Booleans).
     discrete_starts = Dict{Symbol, Any}()
@@ -409,6 +419,9 @@ function eval_AST(
         elseif name in bool_comparison_names
             # Bool-comparison vars are handled separately; skip pass-2 processing.
             continue
+        elseif !haskey(variable_map, name) || is_inlined(variable_map[name])
+            # Skipped String component, or inlined constant
+            continue
         end
 
         if type_prefix == "parameter" || type_prefix == "constant" ||
@@ -426,12 +439,9 @@ function eval_AST(
                     variable_map[name] = ModelingToolkitBase.setguess(variable_map[name], start_value)
                 end
             else
-                # Collect into parameter_val_map; setdefault is applied in pass 3 below.
-                # We cannot call setdefault here because setdefault returns a NEW symbol
-                # object. A forward reference (e.g. V.signalSource.startTime = V.startTime
-                # where V.startTime is declared later) would embed the OLD stale symbol in
-                # the expression — MTK cannot resolve it. Pass 3 substitutes all references
-                # to concrete values first, then setdefault is called once with clean values.
+                # Collect into parameter_val_map; setdefault is applied in pass 3.5 below,
+                # once every value has been collected (values may refer to parameters
+                # declared later, e.g. V.signalSource.startTime = V.startTime).
                 if !isnothing(declaration.modification) && !isempty(declaration.modification)
                     modification = declaration.modification[1]
                     if !isnothing(modification.expr) && !isempty(modification.expr)
@@ -487,17 +497,20 @@ function eval_AST(
         end
     end
 
-    # Pass 3: Substitute parameter cross-references to get concrete values.
-    # e.g. V.signalSource.startTime = V.startTime, V.startTime = 1.0
-    # After substitution: V.signalSource.startTime = 1.0
-    # TODO: this could probably be replaced with the bindings system?
-    for (param, value) in parameter_val_map
-        parameter_val_map[param] = substitute(value, parameter_val_map)
+    # Pass 3: A parameter whose value refers to other parameters (`r = p*q`) keeps it as a
+    # symbolic default, which ModelingToolkit turns into a binding: `r` is then recomputed
+    # whenever `p` or `q` change, and cannot be set itself. A parameter marked
+    # `Evaluate = true` was evaluated at translation, so its value is resolved to a number.
+    for name in evaluated_parameter_names
+        sym = variable_map[name]
+        haskey(parameter_val_map, sym) || continue
+        value = resolve_value(parameter_val_map[sym], parameter_val_map)
+        parameter_val_map[sym] = something(concrete_value(value), value)
     end
 
-    # Pass 3.5: Apply concrete parameter values via setdefault.
-    # Done after pass 3 so we always call setdefault with a resolved concrete value,
-    # never with an expression containing a stale pre-setdefault symbol reference.
+    # Pass 3.5: Apply parameter values via setdefault: a number becomes an initial value,
+    # an expression a binding. Symbols in the expressions may predate setdefault/setguess,
+    # which is fine because metadata does not affect symbol equality.
     for name in collect(keys(variable_map))
         sym = variable_map[name]
         val = get(parameter_val_map, sym, nothing)
@@ -673,7 +686,10 @@ function eval_AST(
     # Both regular @parameters and @discretes symbols have PARAMETER type, so this
     # captures them all — including discrete variables that only appear in callbacks
     # and would be missed by auto-detection from equations.
-    all_pars = Num[sym for (_, sym) in variable_map if ModelingToolkitBase.isparameter(sym)]
+    all_pars = Num[
+        sym for (_, sym) in variable_map
+            if !is_inlined(sym) && ModelingToolkitBase.isparameter(sym)
+    ]
 
     # Build bindings for free parameters (fixed=false): p => missing signals MTK to
     # solve for p during initialization using initialization_eqs.

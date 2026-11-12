@@ -25,6 +25,7 @@ include("julia_parser.jl")
 include("antlr_parser.jl")
 include("events.jl")
 include("evaluator.jl")
+include("parameters.jl")
 include("functions.jl")
 
 """
